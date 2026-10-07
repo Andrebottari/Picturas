@@ -11,3 +11,13 @@ backups/
 
 # ficheiros de ambiente locais (nunca devem ir para o repo)
 .env
+
+# Python (para as ferramentas em Tools/)
+__pycache__/
+*.pyc
+
+# Vídeos de teste (nunca devem ir para o repo)
+*.mp4
+*.mov
+*.webm
+*.mkv
