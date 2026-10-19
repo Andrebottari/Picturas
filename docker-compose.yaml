@@ -86,6 +86,8 @@ services:
       S3_ACCESS_KEY: ${S3_ACCESS_KEY:-admin}
       S3_SECRET_KEY: ${S3_SECRET_KEY:-admin123}
       FRONTEND_URL: "https://localhost:8080"
+      #AB Credencial interna para autenticar carregamentos de vídeo.
+      VIDEO_INTERNAL_SECRET: ${VIDEO_INTERNAL_SECRET:?VIDEO_INTERNAL_SECRET tem de estar definida}
     networks:
       - elk
 
@@ -140,10 +142,19 @@ services:
       RABBITMQ_PORT: 5672
       RABBITMQ_USER: user
       RABBITMQ_PASS: password
+      #AB Permitir validar JWT nas operações de vídeo do serviço projects.
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:?JWT_SECRET_KEY tem de estar definida}
+      #AB Credencial para autenticar pedidos internos de armazenamento de vídeo.
+      VIDEO_INTERNAL_SECRET: ${VIDEO_INTERNAL_SECRET:?VIDEO_INTERNAL_SECRET tem de estar definida}
+            #AB Certificado HTTPS válido para o nome interno projects.
+      PROJECTS_TLS_KEY_FILE: /run/picturas-tls/projects.key
+      PROJECTS_TLS_CERT_FILE: /run/picturas-tls/projects.crt
     networks:
       - elk
     volumes:
       - image_data:/app/images
+      #AB O worker recebe apenas o certificado público.
+      - /tmp/picturas-uc03-tls/projects.crt:/run/picturas-tls/projects.crt:ro
 
   users_mongoDB:
     image: mongo:4.4
@@ -170,7 +181,8 @@ services:
     restart: on-failure
     environment:
       - FREE_DAILY_OP=5
-      - JWT_SECRET_KEY=lisan_al_gaib
+            #AB Utilizar o segredo JWT partilhado entre os serviços.
+      - JWT_SECRET_KEY=${JWT_SECRET_KEY:?JWT_SECRET_KEY tem de estar definida}
       - FIELD_ENCRYPTION_KEY=uma-frase-secreta-bem-grande-ou-64-hex
     networks:
       - elk
@@ -214,7 +226,8 @@ services:
       - users
     restart: on-failure
     environment:
-      - JWT_SECRET_KEY=lisan_al_gaib
+            #AB Utilizar o mesmo segredo JWT do serviço users e projects.
+      - JWT_SECRET_KEY=${JWT_SECRET_KEY:?JWT_SECRET_KEY tem de estar definida}
     networks:
       - elk
     volumes:
@@ -289,6 +302,13 @@ services:
       RABBITMQ_PORT: "5672"
       RABBITMQ_USER: user
       RABBITMQ_PASS: password
+      #AB Endpoint interno para reclamar processamentos de vídeo.
+      VIDEO_CLAIM_URL: https://projects:9001/internal/video/claim
+
+      #AB Credencial partilhada com o serviço projects.
+      VIDEO_INTERNAL_SECRET: ${VIDEO_INTERNAL_SECRET:?VIDEO_INTERNAL_SECRET tem de estar definida}
+
+
     volumes:
       - image_data:/app/images
     networks:
@@ -505,7 +525,8 @@ services:
       - RABBITMQ_PORT=5672
       - RABBITMQ_USER=user
       - RABBITMQ_PASS=password
-      - JWT_SECRET_KEY=lisan_al_gaib
+      #AB Utilizar o segredo JWT partilhado com os restantes serviços.
+      - JWT_SECRET_KEY=${JWT_SECRET_KEY:?JWT_SECRET_KEY tem de estar definida}
 
   mongo-backup:
     image: mongo:4.4

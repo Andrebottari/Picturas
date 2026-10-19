@@ -125,6 +125,25 @@ const videoProcessSchema = new mongoose.Schema(
       default: null,
     },
 
+    //AB Identificador do worker que reclamou esta execução.
+    worker_id: {
+        type: String,
+        default: null,
+    },
+
+    //AB Última comunicação do worker durante o processamento.
+    last_heartbeat_at: {
+        type: Date,
+        default: null,
+    },
+
+    //AB Número de reclamações da execução.
+    attempt: {
+        type: Number,
+        default: 0,
+        min: 0,
+    },
+
     started_at: {
       type: Date,
       default: null,

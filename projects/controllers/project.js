@@ -86,6 +86,37 @@ module.exports.updateRaw = async (user_id, project_id, update) => {
   return await ProjectModel.updateOne(
     { user_id, _id: project_id },
     update
+  ).exec();};
+
+//AB Atualizar apenas os metadados do vídeo original.
+//Respeitar a versão do projeto e preservar imagens e ferramentas.
+module.exports.updateVideoIfVersion = async (
+  userId,
+  projectId,
+  video,
+  expectedVersion
+) => {
+  //AB Impedir atualizações de vídeo com versões inválidas.
+  if (!Number.isSafeInteger(expectedVersion) || expectedVersion < 0) {
+    throw new Error("Versão do projeto inválida.");
+  }
+  return await Project.findOneAndUpdate(
+    {
+      user_id: userId,
+      _id: projectId,
+      version: expectedVersion,
+    },
+    {
+      $set: {
+        video: video,
+      },
+      $inc: {
+        version: 1,
+      },
+    },
+    {
+      new: true,
+      runValidators: true,
+    }
   ).exec();
 };
-

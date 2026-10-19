@@ -2,6 +2,8 @@ import json
 import os
 import time
 import uuid
+import ssl
+from urllib import request, error
 from datetime import datetime, timezone
 
 import pika
@@ -16,7 +18,18 @@ RABBITMQ_PASS = os.getenv("RABBITMQ_PASS", "password")
 
 REQUEST_QUEUE = "video_filters_queue"
 RESULT_EXCHANGE = "picturas"
-RESULT_ROUTING_KEY = "project_queue"
+RESULT_ROUTING_KEY = "video_results_queue"
+
+#AB Endpoint interno para reclamar processamentos antes de executar FFmpeg.
+VIDEO_CLAIM_URL = os.getenv(
+    "VIDEO_CLAIM_URL",
+    "https://projects:9001/internal/video/claim"
+)
+
+VIDEO_INTERNAL_SECRET = os.getenv("VIDEO_INTERNAL_SECRET")
+
+#AB Permitir indicar um certificado de confiança para o HTTPS interno.
+VIDEO_PROJECTS_CA_FILE = os.getenv("VIDEO_PROJECTS_CA_FILE")
 
 
 def converter_filtros(filtros):
@@ -76,6 +89,63 @@ def resposta_erro(message_id, mensagem, tempo_ms):
             "microservice": "picturas-video-filters-tool-ms"
         }
     }
+
+#AB Reclamar uma execução no serviço projects antes de iniciar FFmpeg.
+def reclamar_processamento(message_id):
+    if not VIDEO_INTERNAL_SECRET:
+        raise RuntimeError(
+            "VIDEO_INTERNAL_SECRET não está configurado no worker."
+        )
+
+    corpo = json.dumps({
+        "messageId": message_id
+    }).encode("utf-8")
+
+    pedido = request.Request(
+        VIDEO_CLAIM_URL,
+        data=corpo,
+        headers={
+            "Content-Type": "application/json",
+            "X-Video-Internal-Secret": VIDEO_INTERNAL_SECRET
+        },
+        method="POST"
+    )
+
+    contexto_ssl = ssl.create_default_context(
+        cafile=VIDEO_PROJECTS_CA_FILE
+    )
+
+    try:
+        with request.urlopen(
+            pedido,
+            timeout=15,
+            context=contexto_ssl
+        ) as resposta:
+            dados = json.loads(resposta.read().decode("utf-8"))
+
+    except error.HTTPError as erro:
+        # Erros HTTP não autorizam a execução do FFmpeg.
+        raise RuntimeError(
+            f"Reclamação recusada pelo projects: HTTP {erro.code}"
+        ) from erro
+
+    if not isinstance(dados, dict):
+        raise RuntimeError("Resposta inválida do serviço projects.")
+
+    if dados.get("messageId") != message_id:
+        raise RuntimeError(
+            "O identificador da reclamação não corresponde ao pedido."
+        )
+
+    if dados.get("claimed") is True:
+        return True
+
+    if dados.get("claimed") is False:
+        return False
+
+    raise RuntimeError(
+        "O serviço projects não devolveu um resultado de reclamação válido."
+    )
 
 
 def processar_pedido(mensagem):
@@ -145,18 +215,78 @@ def executar_worker():
                 durable=True
             )
 
+            #AB Fila exclusiva para resultados de processamento de vídeo.
+            canal.queue_declare(
+                queue=RESULT_ROUTING_KEY,
+                durable=True
+            )
+
+            #AB Associar a fila ao exchange utilizado pelo PictuRAS.
+            canal.queue_bind(
+                queue=RESULT_ROUTING_KEY,
+                exchange=RESULT_EXCHANGE,
+                routing_key=RESULT_ROUTING_KEY
+            )
+
             canal.basic_qos(prefetch_count=1)
 
             def callback(ch, method, properties, body):
                 try:
                     mensagem = json.loads(body)
-                    resposta = processar_pedido(mensagem)
-                except Exception as erro:
-                    resposta = resposta_erro(
-                        "desconhecido",
-                        str(erro),
-                        0
+                    message_id = mensagem["messageId"]
+
+                    if not isinstance(message_id, str):
+                        raise ValueError("messageId inválido.")
+
+                except (ValueError, KeyError, TypeError) as erro:
+                    print(
+                        f"[video_filters] Mensagem inválida: {erro}",
+                        flush=True
                     )
+
+                    #AB Uma mensagem sem identificador não pode ser
+                    # reclamada nem associada a um VideoProcess.
+                    ch.basic_reject(
+                        delivery_tag=method.delivery_tag,
+                        requeue=False
+                    )
+                    return
+
+                try:
+                    autorizado = reclamar_processamento(message_id)
+
+                except Exception as erro:
+                    print(
+                        f"[video_filters] Não foi possível reclamar "
+                        f"{message_id}: {erro}",
+                        flush=True
+                    )
+
+                    #AB Sem confirmação do projects, não executar FFmpeg.
+                    # A mensagem regressa à fila para futura entrega.
+                    time.sleep(2)
+
+                    ch.basic_nack(
+                        delivery_tag=method.delivery_tag,
+                        requeue=True
+                    )
+                    return
+
+                if not autorizado:
+                    print(
+                        f"[video_filters] Execução duplicada ou "
+                        f"já terminada: {message_id}",
+                        flush=True
+                    )
+
+                    #AB Não executar FFmpeg nem publicar outro resultado.
+                    ch.basic_ack(
+                        delivery_tag=method.delivery_tag
+                    )
+                    return
+
+                #AB Só o worker que reclamou a tarefa executa FFmpeg.
+                resposta = processar_pedido(mensagem)
 
                 ch.basic_publish(
                     exchange=RESULT_EXCHANGE,
@@ -167,7 +297,9 @@ def executar_worker():
                     )
                 )
 
-                ch.basic_ack(delivery_tag=method.delivery_tag)
+                ch.basic_ack(
+                    delivery_tag=method.delivery_tag
+                )
 
                 print(
                     f"[video_filters] {resposta['status']}",

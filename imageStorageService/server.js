@@ -1,17 +1,24 @@
 const express = require("express");
+
 const uploadRoutes = require("./route/upload");
 const imageRoutes = require("./route/images");
 const deleteRoutes = require("./route/delete");
-const copyRoutes = require("./route/copy"); 
+const copyRoutes = require("./route/copy");
+const videoDeleteRoutes = require("./route/videoDelete");
+const videoRoutes = require("./route/videos");
+const videoSourceRoutes = require("./route/videoSource");
 
 const app = express();
 
 app.use("/upload", uploadRoutes);
 app.use("/image", imageRoutes);
 app.use("/delete", deleteRoutes);
-app.use("/copy", copyRoutes); 
+app.use("/copy", copyRoutes);
 
-const PORT = process.env.PORT || 11000;
+//AB Operações internas de vídeo.
+app.use("/video", videoRoutes);
+app.use("/video-result", videoDeleteRoutes);
+app.use("/video-source", videoSourceRoutes);
 
 app.listen(PORT, () => {
   console.log(`Servidor rodando na porta ${PORT}`);

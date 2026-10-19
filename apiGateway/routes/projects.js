@@ -1,6 +1,10 @@
 var express = require("express");
 var router = express.Router();
 
+const os = require("node:os");
+const path = require("node:path");
+const crypto = require("node:crypto");
+
 const axios = require("axios");
 
 const https = require("https");
@@ -22,6 +26,214 @@ const httpsAgent = new https.Agent({
 
 const storage = multer.memoryStorage();
 const upload = multer({ storage: storage });
+
+//AB Carregamento temporário de vídeos, sem ocupar a memória do Gateway.
+const videoGatewayUpload = multer({
+  storage: multer.diskStorage({
+    destination: (req, file, cb) => {
+      cb(null, os.tmpdir());
+    },
+
+    filename: (req, file, cb) => {
+      cb(null, `picturas-gateway-video-${crypto.randomUUID()}.tmp`);
+    },
+  }),
+
+  limits: {
+    fileSize: 500 * 1024 * 1024,
+    files: 1,
+  },
+
+  fileFilter: (req, file, cb) => {
+    if (
+      file.mimetype !== "video/mp4" ||
+      path.extname(file.originalname).toLowerCase() !== ".mp4"
+    ) {
+      return cb(new Error("Apenas ficheiros MP4 são permitidos."));
+    }
+
+    cb(null, true);
+  },
+});
+
+//AB Encaminhar o carregamento de vídeos para o serviço projects.
+router.post(
+  "/:user/:project/video",
+  auth.checkToken,
+  (req, res, next) => {
+    videoGatewayUpload.single("file")(req, res, (erro) => {
+      if (erro) {
+        return res.status(400).json({
+          message: erro.message,
+        });
+      }
+
+      next();
+    });
+  },
+  async (req, res) => {
+    const ficheiro = req.file;
+
+    if (!ficheiro) {
+      return res.status(400).json({
+        message: "É necessário enviar um vídeo MP4 no campo file.",
+      });
+    }
+
+    try {
+      const form = new FormData();
+
+      form.append("file", fs.createReadStream(ficheiro.path), {
+        filename: ficheiro.originalname,
+        contentType: "video/mp4",
+      });
+
+      const resposta = await axios.post(
+        projectsURL +
+          `${req.params.user}/${req.params.project}/video`,
+        form,
+        {
+          httpsAgent,
+
+          headers: {
+            ...form.getHeaders(),
+
+            // Encaminhar o JWT para validação no serviço projects.
+            Authorization: req.headers.authorization,
+
+            // Preservar o controlo de versões.
+            "X-Project-Version": req.headers["x-project-version"],
+          },
+
+          maxBodyLength: 500 * 1024 * 1024,
+          timeout: 180000,
+        }
+      );
+
+      const novaVersao =
+        resposta.headers?.["x-project-version"];
+
+      if (novaVersao) {
+        res.set("X-Project-Version", novaVersao);
+      }
+
+      return res.status(resposta.status).json(resposta.data);
+    } catch (erro) {
+      return forwardAxiosError(
+        res,
+        erro,
+        "Não foi possível carregar o vídeo."
+      );
+    } finally {
+      //AB Eliminar o ficheiro temporário criado pelo Gateway.
+      try {
+        await fs.promises.unlink(ficheiro.path);
+      } catch (erroLimpeza) {
+        if (erroLimpeza.code !== "ENOENT") {
+          console.error(
+            "[VIDEO GATEWAY] Erro ao eliminar ficheiro temporário:",
+            erroLimpeza.message
+          );
+        }
+      }
+    }
+  }
+);
+
+//AB Iniciar o processamento de filtros visuais num vídeo.
+router.post(
+  "/:user/:project/video/process",
+  auth.checkToken,
+  async (req, res) => {
+    try {
+      const resposta = await axios.post(
+        projectsURL +
+          `${req.params.user}/${req.params.project}/video/process`,
+        {
+          filters: req.body?.filters,
+        },
+        {
+          httpsAgent,
+          headers: {
+            Authorization: req.headers.authorization,
+            "X-Project-Version": req.headers["x-project-version"],
+          },
+          timeout: 180000,
+        }
+      );
+
+      return res.status(resposta.status).json(resposta.data);
+    } catch (erro) {
+      return forwardAxiosError(
+        res,
+        erro,
+        "Não foi possível iniciar o processamento de vídeo."
+      );
+    }
+  }
+);
+
+
+//AB Consultar o estado de um processamento de vídeo.
+router.get(
+  "/:user/:project/video/process/:processId",
+  auth.checkToken,
+  async (req, res) => {
+    try {
+      const resposta = await axios.get(
+        projectsURL +
+          `${req.params.user}/${req.params.project}/video/process/` +
+          encodeURIComponent(req.params.processId),
+        {
+          httpsAgent,
+          headers: {
+            Authorization: req.headers.authorization,
+          },
+          timeout: 30000,
+        }
+      );
+
+      return res.status(resposta.status).json(resposta.data);
+    } catch (erro) {
+      return forwardAxiosError(
+        res,
+        erro,
+        "Não foi possível consultar o processamento de vídeo."
+      );
+    }
+  }
+);
+
+
+//AB Cancelar um processamento de vídeo ainda ativo.
+router.delete(
+  "/:user/:project/video/process/:processId",
+  auth.checkToken,
+  async (req, res) => {
+    try {
+      const resposta = await axios.delete(
+        projectsURL +
+          `${req.params.user}/${req.params.project}/video/process/` +
+          encodeURIComponent(req.params.processId),
+        {
+          httpsAgent,
+          headers: {
+            Authorization: req.headers.authorization,
+          },
+          timeout: 30000,
+        }
+      );
+
+      return res.status(resposta.status).json(resposta.data);
+    } catch (erro) {
+      return forwardAxiosError(
+        res,
+        erro,
+        "Não foi possível cancelar o processamento de vídeo."
+      );
+    }
+  }
+);
 
 const projectsURL = "https://projects:9001/";
 

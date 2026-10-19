@@ -20,9 +20,19 @@ app.set("port", port);
  * Create HTTP server.
  */
 
-const key = fs.readFileSync(__dirname + "/../certs/selfsigned.key");
-const cert = fs.readFileSync(__dirname + "/../certs/selfsigned.crt");
-const options = { key: key, cert: cert };
+//AB Permitir configurar os certificados HTTPS sem substituir os originais.
+const keyPath =
+  process.env.PROJECTS_TLS_KEY_FILE ||
+  __dirname + "/../certs/selfsigned.key";
+
+const certPath =
+  process.env.PROJECTS_TLS_CERT_FILE ||
+  __dirname + "/../certs/selfsigned.crt";
+
+const key = fs.readFileSync(keyPath);
+const cert = fs.readFileSync(certPath);
+
+const options = { key, cert };
 
 var server = https.createServer(options, app);
 
