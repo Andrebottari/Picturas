@@ -273,6 +273,27 @@ services:
     volumes:
       - image_data:/app/images
 
+
+#AB
+#VIDEO
+  video_filters_tool:
+    build:
+      context: ./Tools
+      dockerfile: video_filters/Dockerfile
+    restart: on-failure
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    environment:
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: "5672"
+      RABBITMQ_USER: user
+      RABBITMQ_PASS: password
+    volumes:
+      - image_data:/app/images
+    networks:
+      - elk
+
   contrast_tool:
     build:
       context: ./Tools
@@ -539,3 +560,5 @@ volumes:
   image_data:
   seaweedfs_data:
   subscription_data:
+
+

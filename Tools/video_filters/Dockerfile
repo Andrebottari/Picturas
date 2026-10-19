@@ -6,6 +6,11 @@ RUN apt-get update \
 
 WORKDIR /app
 
-COPY video_filters/video_filters.py /app/video_filters.py
+COPY video_filters/requirements.txt /app/requirements.txt
 
-CMD ["python", "/app/video_filters.py", "--help"]
+RUN pip install --no-cache-dir -r /app/requirements.txt
+
+COPY video_filters/video_filters.py /app/video_filters.py
+COPY video_filters/worker.py /app/worker.py
+
+CMD ["python", "-u", "/app/worker.py"]

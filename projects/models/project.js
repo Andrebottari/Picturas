@@ -13,11 +13,33 @@ const imgSchema = new mongoose.Schema({
   og_sha256: { type: String, required: true }, 
 });
 
+//AB
+// Metadados do vídeo original associado ao projeto.
+// O ficheiro MP4 será guardado no serviço de armazenamento.
+const videoSchema = new mongoose.Schema(
+  {
+    original_key: { type: String, required: true },
+    original_name: { type: String, required: true },
+    mime_type: {
+      type: String,
+      enum: ["video/mp4"],
+      required: true,
+    },
+    size_bytes: { type: Number, required: true, min: 1 },
+    duration_seconds: { type: Number, required: true, min: 0 },
+    width: { type: Number, required: true, min: 1 },
+    height: { type: Number, required: true, min: 1 },
+    uploaded_at: { type: Date, default: Date.now },
+  },
+  { _id: false }
+);
 
 const projectSchema = new mongoose.Schema({
   name: { type: String, required: true },
   user_id: { type: mongoose.Schema.Types.ObjectId, required: true },
   imgs: { type: [imgSchema], default: [] },
+  // Um vídeo original por projeto.
+  video: { type: videoSchema, default: null },
   tools: { type: [toolSchema], default: [] },
   version: { type: Number, default: 0 },
   activeToken: { type: Number, default: 0 },

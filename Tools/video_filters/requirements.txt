@@ -1,2 +1,1 @@
-# Sem dependências Python externas nesta primeira versão.
-# O FFmpeg é instalado no Dockerfile.
+pika==1.3.2
