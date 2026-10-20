@@ -1,0 +1,296 @@
+"use client";
+
+import { useEffect, useRef, useState } from "react";
+import axios from "axios";
+import {
+  Check, CheckCircle2, CircleAlert, Clapperboard, Clock3,
+  Film, LoaderCircle, Play, RotateCcw, SlidersHorizontal,
+  Sparkles, UploadCloud, Video, X,
+} from "lucide-react";
+import { api } from "@/lib/axios";
+import { retirarVideoPendente } from "@/lib/pending-video";
+import { Button } from "@/components/ui/button";
+import { Progress } from "@/components/ui/progress";
+
+//AB UC-03: editor de vídeo independente do editor de imagens.
+type FilterName = "cinzento" | "brilho" | "contraste" | "saturacao";
+type Filter = { name: FilterName; value?: number };
+type ProcessState = {
+  processId: string;
+  status: "pending" | "processing" | "completed" | "failed" | "cancelled";
+  progress?: number;
+  outputVideoKey?: string | null;
+  errorMessage?: string | null;
+};
+
+const ranges: Record<Exclude<FilterName, "cinzento">, { min: number; max: number; step: number; initial: number }> = {
+  brilho: { min: -1, max: 1, step: 0.1, initial: 0.2 },
+  contraste: { min: 0, max: 2, step: 0.1, initial: 1.2 },
+  saturacao: { min: 0, max: 3, step: 0.1, initial: 1.3 },
+};
+const filtersInfo: { name: FilterName; label: string; description: string }[] = [
+  { name: "cinzento", label: "Preto e branco", description: "Converte a imagem para tons de cinzento" },
+  { name: "brilho", label: "Brilho", description: "Ajusta a luminosidade do vídeo" },
+  { name: "contraste", label: "Contraste", description: "Realça a diferença entre tons claros e escuros" },
+  { name: "saturacao", label: "Saturação", description: "Ajusta a intensidade das cores" },
+];
+
+function errorText(err: unknown) {
+  if (axios.isAxiosError(err)) {
+    const value = err.response?.data?.message;
+    return typeof value === "string" ? value : err.message;
+  }
+  return err instanceof Error ? err.message : "Ocorreu um erro inesperado.";
+}
+function displaySize(bytes: number) {
+  return bytes < 1024 * 1024
+    ? `${(bytes / 1024).toFixed(0)} KB`
+    : `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+function formatTime(seconds: number) {
+  const m = Math.floor(seconds / 60);
+  const s = Math.floor(seconds % 60);
+  return `${m}:${String(s).padStart(2, "0")}`;
+}
+const statusLabel: Record<ProcessState["status"], string> = {
+  pending: "Na fila", processing: "A processar", completed: "Concluído",
+  failed: "Falhou", cancelled: "Cancelado",
+};
+
+export function VideoFiltersPanel({ userId, projectId, token, version, onUploaded }: {
+  userId: string;
+  projectId: string;
+  token: string;
+  version: number;
+  onUploaded: () => Promise<unknown> | void;
+}) {
+  const [file, setFile] = useState<File | null>(null);
+  const [previewUrl, setPreviewUrl] = useState<string | null>(null);
+  const [uploadedFile, setUploadedFile] = useState<string | null>(null);
+  const [duration, setDuration] = useState<number | null>(null);
+  const [selected, setSelected] = useState<FilterName[]>(["cinzento"]);
+  const [values, setValues] = useState<Record<string, number>>({
+    brilho: ranges.brilho.initial,
+    contraste: ranges.contraste.initial,
+    saturacao: ranges.saturacao.initial,
+  });
+  const [busy, setBusy] = useState(false);
+  const [dragging, setDragging] = useState(false);
+  const [compareOriginal, setCompareOriginal] = useState(false);
+  const [state, setState] = useState<ProcessState | null>(null);
+  const [notice, setNotice] = useState("");
+  const [error, setError] = useState("");
+  const picker = useRef<HTMLInputElement>(null);
+  const currentVersion = useRef(version);
+  const alive = useRef(true);
+  const base = `projects/${encodeURIComponent(userId)}/${encodeURIComponent(projectId)}/video`;
+  const headers = { Authorization: `Bearer ${token}` };
+  const running = !!state && ["pending", "processing"].includes(state.status);
+
+  //AB Pré-visualização rápida aproximada em CSS; o processamento final usa FFmpeg.
+  const previewFilter = compareOriginal ? "none" : [
+    selected.includes("cinzento") ? "grayscale(1)" : "",
+    selected.includes("brilho") ? `brightness(${Math.max(0, 1 + values.brilho)})` : "",
+    selected.includes("contraste") ? `contrast(${values.contraste})` : "",
+    selected.includes("saturacao") ? `saturate(${values.saturacao})` : "",
+  ].filter(Boolean).join(" ") || "none";
+
+  useEffect(() => { currentVersion.current = version; }, [version]);
+  //AB O MP4 escolhido no Dashboard é disponibilizado ao editor sem novo seletor.
+  useEffect(() => {
+    const pending = retirarVideoPendente();
+    if (pending) chooseFile(pending);
+    // Executar apenas ao abrir este editor, preservando o ficheiro local.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+  useEffect(() => {
+    if (!file) { setPreviewUrl(null); return; }
+    const url = URL.createObjectURL(file);
+    setPreviewUrl(url);
+    return () => URL.revokeObjectURL(url);
+  }, [file]);
+  useEffect(() => () => { alive.current = false; }, []);
+
+  useEffect(() => {
+    if (!state || !running) return;
+    let stopped = false;
+    const timer = window.setInterval(async () => {
+      try {
+        const response = await api.get<ProcessState>(`${base}/process/${encodeURIComponent(state.processId)}`, { headers });
+        if (!stopped && alive.current) {
+          setState(response.data);
+          if (response.data.status === "completed") setNotice("Processamento concluído. O vídeo foi guardado no projeto.");
+        }
+      } catch (err) {
+        if (!stopped && alive.current) setError(`Não foi possível consultar o estado: ${errorText(err)}`);
+      }
+    }, 3000);
+    return () => { stopped = true; window.clearInterval(timer); };
+  }, [base, state?.processId, state?.status, token, running]);
+
+  function chooseFile(next: File | null) {
+    if (!next) return;
+    if (!next.name.toLowerCase().endsWith(".mp4") || (next.type && next.type !== "video/mp4")) {
+      setError("O formato suportado é MP4 com codec H.264. Ficheiros MKV ainda não são suportados.");
+      return;
+    }
+    if (next.size > 500 * 1024 * 1024) {
+      setError("O vídeo não pode exceder 500 MB.");
+      return;
+    }
+    setError(""); setNotice(""); setFile(next); setUploadedFile(null); setState(null); setDuration(null);
+  }
+  function toggleFilter(name: FilterName) {
+    setSelected(old => old.includes(name) ? old.filter(item => item !== name) : [...old, name]);
+  }
+  function resetFilters() {
+    setSelected(["cinzento"]);
+    setValues({ brilho: ranges.brilho.initial, contraste: ranges.contraste.initial, saturacao: ranges.saturacao.initial });
+  }
+
+  //AB Upload reutilizado: "Aplicar filtros" também carrega o MP4 se ainda for local.
+  async function uploadToServer(videoFile: File) {
+    const form = new FormData();
+    form.append("file", videoFile);
+    const result = await api.post(`${base}`, form, {
+      headers: { ...headers, "X-Project-Version": String(currentVersion.current) },
+      timeout: 180000,
+    });
+    const newVersion = Number(result.data?.projectVersion ?? result.headers["x-project-version"]);
+    if (Number.isFinite(newVersion)) currentVersion.current = newVersion;
+    setUploadedFile(videoFile.name);
+    setState(null);
+    await onUploaded();
+  }
+
+  async function upload() {
+    if (!file || busy || running || uploadedFile === file.name) return;
+    setBusy(true); setError(""); setNotice("A carregar vídeo...");
+    try {
+      await uploadToServer(file);
+      setNotice("Vídeo carregado. Podes aplicar os filtros.");
+    } catch (err) { setNotice(""); setError(`Falha ao carregar o vídeo: ${errorText(err)}`); }
+    finally { setBusy(false); }
+  }
+
+  async function processVideo() {
+    if (!file || busy || running) return;
+    if (!selected.length) { setError("Seleciona pelo menos um filtro."); return; }
+    setBusy(true); setError(""); setNotice("");
+    const filters: Filter[] = selected.map(name => name === "cinzento" ? { name } : { name, value: values[name] });
+    //AB Evitar publicar um trabalho se o carregamento do vídeo falhar.
+    if (uploadedFile !== file.name) {
+      try {
+        setNotice("A carregar vídeo antes de aplicar os filtros...");
+        await uploadToServer(file);
+      } catch (err) {
+        setNotice("");
+        setError(`Não foi possível carregar o vídeo: ${errorText(err)}`);
+        setBusy(false);
+        return;
+      }
+    }
+    setNotice("A enviar o processamento...");
+    try {
+      const response = await api.post<ProcessState>(`${base}/process`, { filters }, {
+        headers: { ...headers, "X-Project-Version": String(currentVersion.current) },
+        timeout: 180000,
+      });
+      setState(response.data);
+      setNotice("Pedido enviado. O estado é atualizado automaticamente.");
+    } catch (err) {
+      if (axios.isAxiosError(err) && err.response?.data?.publicationUncertain && err.response.data.processId) {
+        setState({ processId: err.response.data.processId, status: "pending" });
+        setNotice("Publicação por confirmar; vamos acompanhar o estado antes de repetir.");
+      } else { setNotice(""); setError(errorText(err)); }
+    } finally { setBusy(false); }
+  }
+
+  async function cancel() {
+    if (!state) return;
+    setBusy(true); setError("");
+    try {
+      const result = await api.delete<ProcessState>(`${base}/process/${encodeURIComponent(state.processId)}`, { headers });
+      setState(old => old ? { ...old, status: result.data.status } : null);
+      setNotice("Pedido cancelado no servidor.");
+    } catch (err) { setError(errorText(err)); }
+    finally { setBusy(false); }
+  }
+
+  return (
+    <section aria-label="Editor de vídeo UC-03" className="flex min-h-0 flex-1 flex-col bg-background">
+      {/* AB: cabeçalho compacto, no padrão das ferramentas do PictuRAS. */}
+      <header className="flex flex-wrap items-center justify-between gap-3 border-b px-4 py-3 md:px-6">
+        <div className="flex min-w-0 items-center gap-3">
+          <span className="flex size-10 shrink-0 items-center justify-center rounded-xl bg-primary/10 text-primary"><Clapperboard className="size-5" /></span>
+          <div className="min-w-0"><h2 className="font-semibold leading-tight">Editor de vídeo</h2><p className="text-xs text-muted-foreground">UC-03 · Filtros visuais · MP4 / H.264</p></div>
+        </div>
+        <div className="flex items-center gap-2 text-xs text-muted-foreground">
+          <span className="rounded-full border px-3 py-1.5">Até 500 MB</span>
+          {state && <span role="status" className="rounded-full border border-primary/30 bg-primary/10 px-3 py-1.5 font-medium text-foreground">{statusLabel[state.status]}</span>}
+        </div>
+      </header>
+
+      <div className="grid min-h-0 flex-1 grid-cols-1 lg:grid-cols-[minmax(0,1fr)_310px] xl:grid-cols-[minmax(0,1fr)_340px]">
+        {/* AB: área de trabalho visual com proporção 16:9 e controlos nativos acessíveis. */}
+        <main className="flex min-w-0 flex-col gap-4 bg-muted/20 p-4 md:p-6">
+          <div className="flex items-center justify-between gap-2"><div><h3 className="text-sm font-semibold">Pré-visualização dos filtros</h3><p className="text-xs text-muted-foreground">Resultado aproximado em tempo real · exportação final por FFmpeg</p></div>{file && <span className="hidden rounded-md border bg-background px-2 py-1 text-xs text-muted-foreground sm:inline">{displaySize(file.size)}</span>}</div>
+          <div className="flex min-h-[220px] w-full flex-1 items-center justify-center overflow-hidden rounded-xl border border-border bg-zinc-950 p-3 shadow-sm sm:min-h-[360px]">
+            {previewUrl ? (
+              <video key={previewUrl} className="max-h-[min(55vh,550px)] w-full rounded-md object-contain" style={{ filter: previewFilter }} src={previewUrl} controls playsInline preload="metadata" aria-label="Pré-visualização do vídeo original" onLoadedMetadata={event => setDuration(event.currentTarget.duration)} />
+            ) : (
+              <div className="flex max-w-sm flex-col items-center gap-3 text-center text-zinc-300"><span className="rounded-2xl bg-white/10 p-5"><Video className="size-10" /></span><p className="text-base font-medium text-white">O teu vídeo aparece aqui</p><p className="text-sm text-zinc-400">Escolhe um MP4 para pré-visualizar, configurar e aplicar os filtros.</p><Button type="button" variant="secondary" onClick={() => picker.current?.click()}><UploadCloud className="mr-2 size-4" />Selecionar MP4</Button></div>
+            )}
+          </div>
+          {previewUrl && <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg border bg-card p-3">
+            <p className="text-xs text-muted-foreground">Ajusta os filtros com o vídeo a reproduzir. A pré-visualização é aproximada e pode diferir do FFmpeg.</p>
+            <Button type="button" size="sm" variant={compareOriginal ? "default" : "outline"}
+              onPointerDown={() => setCompareOriginal(true)} onPointerUp={() => setCompareOriginal(false)}
+              onPointerLeave={() => setCompareOriginal(false)} onPointerCancel={() => setCompareOriginal(false)}
+              onKeyDown={event => { if (event.key === " " || event.key === "Enter") setCompareOriginal(true); }}
+              onKeyUp={() => setCompareOriginal(false)}
+            >Premir para comparar original</Button>
+          </div>}
+          <div className="rounded-xl border bg-card px-4 py-3">
+            <div className="flex flex-wrap items-center gap-3">
+              <span className="flex size-9 items-center justify-center rounded-lg bg-muted"><Film className="size-4" /></span>
+              <div className="min-w-0 flex-1"><p className="truncate text-sm font-medium">{file?.name ?? "Nenhum vídeo selecionado"}</p><p className="text-xs text-muted-foreground">{file ? `${displaySize(file.size)}${duration != null && Number.isFinite(duration) ? ` · ${formatTime(duration)}` : ""}` : "Formato MP4/H.264 · máximo 500 MB"}</p></div>
+              {uploadedFile === file?.name && <span className="inline-flex items-center gap-1 text-xs text-emerald-600 dark:text-emerald-400"><CheckCircle2 className="size-4" />Carregado</span>}
+              <Button type="button" size="sm" variant="outline" disabled={busy || running} onClick={() => picker.current?.click()}>{file ? "Trocar vídeo" : "Escolher vídeo"}</Button>
+            </div>
+          </div>
+          <div onDragOver={event => { if (!busy && !running) { event.preventDefault(); setDragging(true); } }} onDragLeave={() => setDragging(false)} onDrop={event => { event.preventDefault(); setDragging(false); if (!busy && !running) chooseFile(event.dataTransfer.files[0] || null); }} className={`rounded-lg border border-dashed px-4 py-3 text-center text-xs text-muted-foreground transition-colors ${dragging ? "border-primary bg-primary/5" : "border-border"}`}>
+            <UploadCloud className="mr-2 inline size-4" /> Também podes arrastar um vídeo MP4 para aqui
+          </div>
+        </main>
+
+        {/* AB: parâmetros sempre visíveis, agrupados e identificados. */}
+        <aside className="min-w-0 border-t bg-card lg:border-l lg:border-t-0">
+          <div className="sticky top-0 flex items-center gap-2 border-b bg-card px-5 py-4"><SlidersHorizontal className="size-4 text-primary" /><h3 className="text-sm font-semibold">Ajustar filtros</h3><span className="ml-auto text-xs text-muted-foreground">{selected.length} ativos</span></div>
+          <fieldset className="space-y-3 p-4" disabled={busy || running}>
+            <legend className="sr-only">Escolher filtros de vídeo</legend>
+            {filtersInfo.map(item => {
+              const active = selected.includes(item.name);
+              return <div key={item.name} className={`rounded-xl border p-3 transition-colors ${active ? "border-primary/40 bg-primary/5" : "bg-background"}`}>
+                <label className="flex cursor-pointer items-start gap-3"><input type="checkbox" className="mt-1 size-4 accent-blue-500" checked={active} onChange={() => toggleFilter(item.name)} /><span className="min-w-0 flex-1"><span className="block text-sm font-semibold">{item.label}</span><span className="mt-0.5 block text-xs leading-relaxed text-muted-foreground">{item.description}</span></span>{active && <Check className="size-4 shrink-0 text-primary" />}</label>
+                {active && item.name !== "cinzento" && <div className="mt-3 border-t pt-3"><div className="mb-1.5 flex justify-between text-xs text-muted-foreground"><span>Intensidade</span><output className="font-medium tabular-nums text-foreground">{values[item.name].toFixed(1)}</output></div><input className="w-full accent-blue-500" aria-label={`Valor de ${item.label}`} type="range" min={ranges[item.name].min} max={ranges[item.name].max} step={ranges[item.name].step} value={values[item.name]} onChange={event => setValues(old => ({ ...old, [item.name]: Number(event.target.value) }))} /><div className="flex justify-between text-[11px] text-muted-foreground"><span>{ranges[item.name].min}</span><span>{ranges[item.name].max}</span></div></div>}
+              </div>;
+            })}
+            <Button type="button" variant="ghost" size="sm" onClick={resetFilters} className="w-full text-muted-foreground"><RotateCcw className="mr-2 size-3.5" />Repor filtros</Button>
+          </fieldset>
+          <div className="mx-4 mb-4 rounded-lg bg-muted/50 p-3 text-xs leading-relaxed text-muted-foreground"><Sparkles className="mb-1 inline size-4 text-primary" /> Os efeitos nesta pré-visualização são aproximados. O FFmpeg aplica os ajustes ao vídeo completo quando iniciares o processamento.</div>
+        </aside>
+      </div>
+
+      <footer className="border-t bg-card px-4 py-4 md:px-6">
+        {state && <div className="mb-3 space-y-2"><div className="flex items-center justify-between text-xs"><span className="inline-flex items-center gap-2 font-medium">{running ? <LoaderCircle className="size-3.5 animate-spin" /> : state.status === "completed" ? <CheckCircle2 className="size-3.5 text-emerald-500" /> : <Clock3 className="size-3.5" />}{statusLabel[state.status]}</span>{typeof state.progress === "number" && <span className="tabular-nums text-muted-foreground">{state.progress}%</span>}</div><Progress value={typeof state.progress === "number" ? state.progress : running ? 12 : state.status === "completed" ? 100 : 0} className="h-1.5" /></div>}
+        {error && <p className="mb-3 flex items-start gap-2 rounded-lg border border-destructive/30 bg-destructive/10 p-3 text-sm text-destructive" role="alert"><CircleAlert className="mt-0.5 size-4 shrink-0" />{error}</p>}
+        {state?.status === "failed" && <p className="mb-3 text-sm text-destructive" role="alert">{state.errorMessage || "O processamento falhou."}</p>}
+        {state?.status === "completed" && <p className="mb-3 text-xs text-muted-foreground">O resultado foi guardado. A pré-visualização e o download do MP4 final aguardam uma rota autenticada de leitura.</p>}
+        {notice && <p className="mb-3 text-xs text-muted-foreground" role="status">{notice}</p>}
+        <div className="flex flex-wrap items-center justify-between gap-3"><div className="text-xs text-muted-foreground"><span className="font-medium text-foreground">1.</span> Escolher vídeo <span className="mx-1">→</span> <span className="font-medium text-foreground">2.</span> Ajustar filtros <span className="mx-1">→</span> <span className="font-medium text-foreground">3.</span> Aplicar (upload automático)</div><div className="flex flex-wrap items-center gap-2">{running && <Button type="button" variant="outline" disabled={busy} onClick={cancel}><X className="mr-2 size-4" />Cancelar</Button>}<Button type="button" variant="outline" disabled={!file || busy || running || (uploadedFile === file?.name)} onClick={upload}>{busy ? <LoaderCircle className="mr-2 size-4 animate-spin" /> : <UploadCloud className="mr-2 size-4" />}Carregar vídeo</Button><Button type="button" disabled={!file || !selected.length || busy || running} onClick={processVideo}>{busy ? <LoaderCircle className="mr-2 size-4 animate-spin" /> : <Play className="mr-2 size-4" />}Aplicar filtros</Button></div></div>
+      </footer>
+      <input ref={picker} type="file" accept=".mp4,video/mp4" className="sr-only" aria-label="Selecionar vídeo MP4" disabled={busy || running} onChange={event => { chooseFile(event.target.files?.[0] || null); event.currentTarget.value = ""; }} />
+    </section>
+  );
+}

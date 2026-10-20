@@ -18,6 +18,11 @@ const {
 const EXCHANGE = "picturas";
 const RESULTS_QUEUE = "video_results_queue";
 
+//AB Uma execução abandonada é assinalada como falhada, nunca reexecutada.
+//AB Margem deliberadamente grande para falhas transitórias de rede.
+const ABANDONO_MS = 30 * 60 * 1000;
+const VERIFICACAO_MS = 5 * 60 * 1000;
+
 const rabbitHost = process.env.RABBITMQ_HOST;
 const rabbitPort = process.env.RABBITMQ_PORT;
 const rabbitUser = process.env.RABBITMQ_USER;
@@ -55,6 +60,16 @@ function validarResposta(resposta) {
 
   if (!["success", "error"].includes(resposta.status)) {
     throw new Error("Estado da resposta inválido.");
+  }
+
+  //AB Vincular cada resultado à tentativa e ao worker que a reclamou.
+  if (
+    typeof resposta.metadata?.workerId !== "string" ||
+    !/^[a-zA-Z0-9_-]{1,128}$/.test(resposta.metadata.workerId) ||
+    !Number.isSafeInteger(resposta.metadata.attempt) ||
+    resposta.metadata.attempt < 1
+  ) {
+    throw new Error("Resultado sem identidade de tentativa válida.");
   }
 
   if (resposta.status === "success") {
@@ -112,120 +127,89 @@ async function tratarResultadoVideo(resposta) {
   });
 
   if (!processo) {
-    console.warn(
-      `[VIDEO] Execução não encontrada: ${resposta.correlationId}`
-    );
-
-    // Uma resposta sem execução correspondente não deve criar
-    // automaticamente um processo ou associar ficheiros.
+    console.warn(`[VIDEO] Execução não encontrada: ${resposta.correlationId}`);
     return;
   }
 
-  if (["completed", "failed", "cancelled"].includes(processo.status)) {
-    console.log(
-      `[VIDEO] Resposta ignorada: processo ${processo.msg_id} ` +
-      `já está em estado ${processo.status}`
-    );
-
+  //AB Mensagens antigas, de outro worker ou de estados terminais não
+  //AB podem alterar os dados, nem enviar objetos para o armazenamento.
+  if (
+    processo.status !== "processing" ||
+    processo.worker_id !== resposta.metadata.workerId ||
+    processo.attempt !== resposta.metadata.attempt
+  ) {
+    console.warn(`[VIDEO] Resultado de tentativa inválida: ${processo.msg_id}`);
     return;
   }
+
+  const identidade = {
+    _id: processo._id,
+    status: "processing",
+    worker_id: resposta.metadata.workerId,
+    attempt: resposta.metadata.attempt,
+  };
 
   if (resposta.status === "error") {
-  //AB Atualizar apenas processos ainda ativos.
-  // Evita substituir um cancelamento ocorrido entretanto.
-  const atualizado = await VideoProcess.findOneAndUpdate(
-    {
-      _id: processo._id,
-      status: { $in: ["pending", "processing"] },
-    },
-    {
-      $set: {
-        status: "failed",
-        error_message:
-          resposta.error?.message ||
-          resposta.error?.msg ||
-          "Erro no processamento de vídeo",
-        finished_at: new Date(),
+    const atualizado = await VideoProcess.findOneAndUpdate(
+      identidade,
+      {
+        $set: {
+          status: "failed",
+          error_message:
+            resposta.error?.message || resposta.error?.msg ||
+            "Erro no processamento de vídeo",
+          finished_at: new Date(),
+        },
       },
-    },
-    {
-      new: true,
-      runValidators: true,
-    }
-  );
-
-  if (!atualizado) {
-    console.log(
-      `[VIDEO] Erro ignorado: processo ${processo.msg_id} ` +
-      "já foi terminado ou cancelado."
+      { new: true, runValidators: true }
     );
+    if (atualizado) {
+      console.log(`[VIDEO] Processo falhou: ${processo.msg_id}`);
+    }
     return;
   }
 
-  console.log(`[VIDEO] Processo falhou: ${processo.msg_id}`);
-  return;
-}
-
-    //AB Validar o vídeo produzido antes de o guardar no SeaweedFS.
+  //AB Aceitar apenas o output esperado para esta mensagem.
   const caminhoRecebido = resposta.output.videoURI;
-  const diretorioPermitido = "/app/images";
-
-  if (!path.isAbsolute(caminhoRecebido)) {
-    throw new Error("O caminho do vídeo processado não é absoluto.");
+  const caminhoEsperado = path.join(
+    "/app/images", "video-filters", processo.msg_id, "output.mp4"
+  );
+  if (caminhoRecebido !== caminhoEsperado) {
+    throw new Error("O resultado não corresponde ao caminho deste processo.");
   }
 
-  // Resolver links simbólicos para impedir o acesso fora do volume.
-  const diretorioReal = await fs.realpath(diretorioPermitido);
+  //AB Impedir symlinks e acesso fora do volume partilhado.
+  const diretorioReal = await fs.realpath("/app/images");
   const caminhoReal = await fs.realpath(caminhoRecebido);
-
-  const caminhoRelativo = path.relative(
-    diretorioReal,
-    caminhoReal
-  );
-
+  const relativo = path.relative(diretorioReal, caminhoReal);
   if (
-    !caminhoRelativo ||
-    caminhoRelativo === ".." ||
-    caminhoRelativo.startsWith(`..${path.sep}`) ||
-    path.isAbsolute(caminhoRelativo)
+    !relativo || relativo === ".." ||
+    relativo.startsWith(`..${path.sep}`) || path.isAbsolute(relativo)
   ) {
     throw new Error("Vídeo processado fora do diretório permitido.");
   }
-
-  if (path.extname(caminhoReal).toLowerCase() !== ".mp4") {
-    throw new Error("O resultado do processamento não é um MP4.");
-  }
-
   const informacao = await fs.stat(caminhoReal);
-
   if (!informacao.isFile() || informacao.size === 0) {
     throw new Error("O vídeo processado está vazio ou é inválido.");
   }
 
-  //AB Guardar o resultado na área 'out' do projeto.
+  //AB A escrita no armazenamento precede a operação atómica no MongoDB.
+  //AB A chave de saída por msg_id é estável para reentregas da mensagem.
   const resultado = await postVideo(
-  String(processo.user_id),
-  String(processo.project_id),
-  caminhoReal,
-  path.basename(caminhoReal),
-  "out",
-  processo.msg_id
-);
-
+    String(processo.user_id),
+    String(processo.project_id),
+    caminhoReal,
+    path.basename(caminhoReal),
+    "out",
+    processo.msg_id
+  );
   const videoKey = resultado?.data?.videoKey;
-
   if (typeof videoKey !== "string" || !videoKey) {
-    throw new Error(
-      "O armazenamento não devolveu uma chave de vídeo válida."
-    );
+    throw new Error("O armazenamento não devolveu uma chave válida.");
   }
 
-  //AB Concluir apenas um processo que ainda não foi terminado.
   const atualizado = await VideoProcess.findOneAndUpdate(
-    {
-      _id: processo._id,
-      status: { $in: ["pending", "processing"] },
-    },
+    identidade,
     {
       $set: {
         status: "completed",
@@ -235,76 +219,55 @@ async function tratarResultadoVideo(resposta) {
         error_message: null,
       },
     },
-    {
-      new: true,
-      runValidators: true,
-    }
+    { new: true, runValidators: true }
   );
 
   if (!atualizado) {
-  //AB Consultar o estado atual antes de decidir sobre a limpeza.
-  const estadoAtual = await VideoProcess.findById(processo._id);
-
-  if (!estadoAtual) {
-    console.warn(
-      `[VIDEO] Processo removido durante o armazenamento: ${processo.msg_id}`
-    );
-
-    // Não eliminar automaticamente sem conhecer o estado atual.
+    const estadoAtual = await VideoProcess.findById(processo._id);
+    if (estadoAtual?.status === "cancelled") {
+      //AB Apenas depois da mudança para cancelled podemos eliminar
+      //AB o objeto estável desta execução.
+      await deleteVideoResult(
+        String(processo.user_id), String(processo.project_id), videoKey
+      );
+      await limparResultadoConcluido(processo, caminhoRecebido);
+    } else {
+      //AB Nunca eliminar um resultado potencialmente em uso.
+      console.warn(`[VIDEO] Resultado ignorado após alteração de estado: ${processo.msg_id}`);
+    }
     return;
   }
 
-  if (estadoAtual.status === "completed") {
-    console.log(
-      `[VIDEO] Processo já concluído: ${processo.msg_id}`
-    );
-
-    // Não apagar um resultado que possa estar em utilização.
-    return;
-  }
-
-  if (estadoAtual.status === "cancelled") {
-    console.warn(
-      `[VIDEO] Processo cancelado: ${processo.msg_id}`
-    );
-
-    // A chave estável pertence exclusivamente a este processamento.
-    // Solicitar a eliminação do objeto resultante.
-    await deleteVideoResult(
-        String(processo.user_id),
-         String(processo.project_id),
-        videoKey
-    );
-
-      console.log(
-        `[VIDEO] Resultado cancelado eliminado: ${processo.msg_id}`
-    );
-
-    //AB O worker já devolveu o resultado e o objeto armazenado foi eliminado.
-    await limparResultadoConcluido(processo, caminhoRecebido);
-
-    return;
-    
-
-    return;
-  }
-
-  console.warn(
-    `[VIDEO] Estado inesperado após armazenamento: ${estadoAtual.status}`
-  );
-  return;
+  console.log(`[VIDEO] Processamento concluído: ${processo.msg_id}`);
+  await limparResultadoConcluido(processo, caminhoRecebido);
 }
 
-  console.log(
-    `[VIDEO] Processamento concluído: ${processo.msg_id}`
+//AB Fechar estados antigos sem reexecutar FFmpeg nem reclamar a mensagem.
+//AB O utilizador poderá iniciar um novo processamento manualmente.
+async function sinalizarProcessosAbandonados(agora = new Date()) {
+  const limite = new Date(agora.getTime() - ABANDONO_MS);
+  const processing = await VideoProcess.updateMany(
+    { status: "processing", last_heartbeat_at: { $lt: limite } },
+    {
+      $set: {
+        status: "failed",
+        finished_at: agora,
+        error_message: "Processamento interrompido: atividade do worker expirada.",
+      },
+    }
   );
-
-  //AB O resultado já está armazenado e o estado completed foi persistido.
-await limparResultadoConcluido(processo, caminhoRecebido);
+  const pending = await VideoProcess.updateMany(
+    { status: "pending", createdAt: { $lt: limite } },
+    {
+      $set: {
+        status: "failed",
+        finished_at: agora,
+        error_message: "Processamento não iniciado dentro do prazo.",
+      },
+    }
+  );
+  return { processing: processing.modifiedCount, pending: pending.modifiedCount };
 }
-
-
-
 
 //AB Consumidor independente para resultados de vídeo.
 async function iniciarConsumidorVideo() {
@@ -377,10 +340,26 @@ async function iniciarConsumidorVideo() {
     }
   );
 
-  console.log(
-    "[VIDEO] Consumidor de resultados iniciado."
-  );
+  //AB Verificação limitada; erros não devem terminar o consumidor.
+  const verificar = async () => {
+    try {
+      const total = await sinalizarProcessosAbandonados();
+      if (total.processing || total.pending) {
+        console.warn("[VIDEO] Processamentos abandonados sinalizados:", total);
+      }
+    } catch (erro) {
+      console.error("[VIDEO] Falha na verificação de abandono:", erro.message);
+    }
+  };
+  const temporizador = setInterval(verificar, VERIFICACAO_MS);
+  temporizador.unref?.();
+  ligacao.on("close", () => clearInterval(temporizador));
+  ligacao.on("error", (erro) => {
+    console.error("[VIDEO] Ligação RabbitMQ com erro:", erro.message);
+  });
+  await verificar();
 
+  console.log("[VIDEO] Consumidor de resultados iniciado.");
   return { ligacao, canal };
 }
 
@@ -389,4 +368,5 @@ module.exports = {
   validarResposta,
   tratarResultadoVideo,
   iniciarConsumidorVideo,
+  sinalizarProcessosAbandonados,
 };

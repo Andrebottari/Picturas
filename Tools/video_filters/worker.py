@@ -3,6 +3,8 @@ import os
 import time
 import uuid
 import ssl
+import socket
+import threading
 from urllib import request, error
 from datetime import datetime, timezone
 
@@ -30,6 +32,12 @@ VIDEO_INTERNAL_SECRET = os.getenv("VIDEO_INTERNAL_SECRET")
 
 #AB Permitir indicar um certificado de confiança para o HTTPS interno.
 VIDEO_PROJECTS_CA_FILE = os.getenv("VIDEO_PROJECTS_CA_FILE")
+
+#AB Identificador desta instância do worker.
+WORKER_ID = os.getenv("VIDEO_WORKER_ID") or socket.gethostname()
+
+#AB Intervalo entre comunicações de atividade do worker.
+VIDEO_HEARTBEAT_INTERVAL = 15
 
 
 def converter_filtros(filtros):
@@ -90,6 +98,7 @@ def resposta_erro(message_id, mensagem, tempo_ms):
         }
     }
 
+
 #AB Reclamar uma execução no serviço projects antes de iniciar FFmpeg.
 def reclamar_processamento(message_id):
     if not VIDEO_INTERNAL_SECRET:
@@ -98,7 +107,8 @@ def reclamar_processamento(message_id):
         )
 
     corpo = json.dumps({
-        "messageId": message_id
+        "messageId": message_id,
+        "workerId": WORKER_ID
     }).encode("utf-8")
 
     pedido = request.Request(
@@ -138,7 +148,15 @@ def reclamar_processamento(message_id):
         )
 
     if dados.get("claimed") is True:
-        return True
+        if dados.get("workerId") != WORKER_ID:
+            raise RuntimeError(
+                "A reclamação foi atribuída a outro worker."
+            )
+
+        tentativa = dados.get("attempt")
+        if type(tentativa) is not int or tentativa < 1:
+            raise RuntimeError("A reclamação não devolveu uma tentativa válida.")
+        return tentativa
 
     if dados.get("claimed") is False:
         return False
@@ -146,6 +164,92 @@ def reclamar_processamento(message_id):
     raise RuntimeError(
         "O serviço projects não devolveu um resultado de reclamação válido."
     )
+
+
+#AB Informar o serviço projects de que esta execução continua ativa.
+def enviar_heartbeat(message_id):
+    if not VIDEO_INTERNAL_SECRET:
+        raise RuntimeError(
+            "VIDEO_INTERNAL_SECRET não está configurado."
+        )
+
+    corpo = json.dumps({
+        "messageId": message_id,
+        "workerId": WORKER_ID
+    }).encode("utf-8")
+
+    #AB Utilizar o mesmo serviço interno da reclamação.
+    heartbeat_url = VIDEO_CLAIM_URL.rsplit("/", 1)[0] + "/heartbeat"
+
+    pedido = request.Request(
+        heartbeat_url,
+        data=corpo,
+        headers={
+            "Content-Type": "application/json",
+            "X-Video-Internal-Secret": VIDEO_INTERNAL_SECRET
+        },
+        method="POST"
+    )
+
+    contexto_ssl = ssl.create_default_context(
+        cafile=VIDEO_PROJECTS_CA_FILE
+    )
+
+    try:
+        with request.urlopen(
+            pedido,
+            timeout=10,
+            context=contexto_ssl
+        ) as resposta:
+            dados = json.loads(
+                resposta.read().decode("utf-8")
+            )
+
+    except error.HTTPError as erro:
+        if erro.code == 409:
+            #AB O processo pode ter sido cancelado ou concluído.
+            return False
+
+        raise RuntimeError(
+            f"Heartbeat recusado: HTTP {erro.code}"
+        ) from erro
+
+    if (
+        not isinstance(dados, dict)
+        or dados.get("messageId") != message_id
+        or dados.get("workerId") != WORKER_ID
+        or dados.get("active") is not True
+    ):
+        raise RuntimeError(
+            "Resposta de heartbeat inválida."
+        )
+
+    return True
+
+
+#AB Enviar heartbeats enquanto o FFmpeg estiver em execução.
+def manter_heartbeat(message_id, parar):
+    while not parar.wait(VIDEO_HEARTBEAT_INTERVAL):
+        try:
+            ativo = enviar_heartbeat(message_id)
+
+            if not ativo:
+                print(
+                    f"[video_filters] Heartbeat recusado: {message_id}",
+                    flush=True
+                )
+
+                #AB Não insistir num processo que já não está ativo.
+                return
+
+        except Exception as erro:
+            #AB Uma falha temporária de comunicação não deve
+            # terminar a thread nem interromper o FFmpeg.
+            print(
+                f"[video_filters] Falha no heartbeat "
+                f"{message_id}: {erro}",
+                flush=True
+            )
 
 
 def processar_pedido(mensagem):
@@ -200,6 +304,7 @@ def executar_worker():
     )
 
     while True:
+        ligacao = None
         try:
             ligacao = pika.BlockingConnection(parametros)
             canal = ligacao.channel()
@@ -228,6 +333,8 @@ def executar_worker():
                 routing_key=RESULT_ROUTING_KEY
             )
 
+            #AB Exigir confirmação do RabbitMQ ao publicar resultados.
+            canal.confirm_delivery()
             canal.basic_qos(prefetch_count=1)
 
             def callback(ch, method, properties, body):
@@ -286,17 +393,49 @@ def executar_worker():
                     return
 
                 #AB Só o worker que reclamou a tarefa executa FFmpeg.
-                resposta = processar_pedido(mensagem)
+                parar_heartbeat = threading.Event()
 
+                thread_heartbeat = threading.Thread(
+                    target=manter_heartbeat,
+                    args=(message_id, parar_heartbeat),
+                    daemon=True
+                )
+
+                thread_heartbeat.start()
+
+                try:
+                    resposta = processar_pedido(mensagem)
+
+                finally:
+                    #AB Parar a comunicação periódica quando o FFmpeg terminar.
+                    parar_heartbeat.set()
+
+                    #AB Esperar que uma comunicação já iniciada termine.
+                    thread_heartbeat.join(timeout=12)
+
+
+                #AB Identificar a execução que produziu o resultado.
+                #AB O consumidor rejeita respostas de tentativas antigas.
+                resposta["metadata"]["workerId"] = WORKER_ID
+                resposta["metadata"]["attempt"] = int(autorizado)
+
+                #AB Publicar o resultado com confirmação do RabbitMQ.
+                #AB mandatory=True exige que exista uma fila de destino.
+                #AB confirm_delivery() faz com que falhas de publicação
+                #AB sejam sinalizadas por exceção; não testar retorno True.
                 ch.basic_publish(
                     exchange=RESULT_EXCHANGE,
                     routing_key=RESULT_ROUTING_KEY,
                     body=json.dumps(resposta),
                     properties=pika.BasicProperties(
-                        delivery_mode=2
-                    )
+                        delivery_mode=2,
+                        content_type="application/json"
+                    ),
+                    mandatory=True
                 )
 
+                #AB Confirmar uma única vez o pedido original, apenas
+                #AB depois de o RabbitMQ confirmar a publicação.
                 ch.basic_ack(
                     delivery_tag=method.delivery_tag
                 )
@@ -319,11 +458,25 @@ def executar_worker():
 
             canal.start_consuming()
 
-        except pika.exceptions.AMQPConnectionError as erro:
+        except Exception as erro:
+            #AB Não confirmar mensagens quando ocorre uma falha
+            # de publicação ou de comunicação com o RabbitMQ.
             print(
-                f"[video_filters] RabbitMQ indisponível: {erro}",
+                f"[video_filters] Falha no worker ou no RabbitMQ: {erro}",
                 flush=True
             )
+
+            #AB Fechar a ligação para que mensagens ainda não
+            # confirmadas possam ser novamente entregues.
+            try:
+                if ligacao is not None and ligacao.is_open:
+                    ligacao.close()
+            except Exception as erro_fecho:
+                print(
+                    f"[video_filters] Erro ao fechar ligação: {erro_fecho}",
+                    flush=True
+                )
+
             time.sleep(5)
 
 

@@ -116,4 +116,78 @@ router.post("/claim", autenticarServicoInterno, async (req, res) => {
   }
 });
 
+//AB Registar atividade do worker responsável por um processamento.
+router.post(
+  "/heartbeat",
+  autenticarServicoInterno,
+  async (req, res) => {
+    const { messageId, workerId } = req.body || {};
+
+    if (
+      typeof messageId !== "string" ||
+      !/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(messageId)
+    ) {
+      return res.status(400).json({
+        message: "messageId inválido.",
+      });
+    }
+
+    if (
+      typeof workerId !== "string" ||
+      !/^[a-zA-Z0-9_-]{1,128}$/.test(workerId)
+    ) {
+      return res.status(400).json({
+        message: "workerId inválido.",
+      });
+    }
+
+    try {
+      //AB Atualizar apenas a execução ativa reclamada por este worker.
+      const atualizado = await VideoProcess.findOneAndUpdate(
+        {
+          msg_id: messageId,
+          worker_id: workerId,
+          status: "processing",
+        },
+        {
+          $set: {
+            last_heartbeat_at: new Date(),
+          },
+        },
+        {
+          new: true,
+          runValidators: true,
+        }
+      );
+
+      if (atualizado) {
+        return res.status(200).json({
+          messageId,
+          workerId,
+          active: true,
+          status: "processing",
+          lastHeartbeatAt: atualizado.last_heartbeat_at,
+        });
+      }
+
+      //AB Não revelar informações sobre outros workers.
+      // Sem uma execução ativa correspondente, o heartbeat é recusado.
+      return res.status(409).json({
+        message:
+          "O processamento não está ativo ou não pertence a este worker.",
+        active: false,
+      });
+    } catch (erro) {
+      console.error(
+        "[VIDEO HEARTBEAT] Erro ao atualizar atividade:",
+        erro.message
+      );
+
+      return res.status(503).json({
+        message: "Não foi possível atualizar a atividade do worker.",
+      });
+    }
+  }
+);
+
 module.exports = router;

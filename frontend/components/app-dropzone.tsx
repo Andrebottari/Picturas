@@ -7,9 +7,10 @@ import Dropzone from "react-dropzone";
 interface CustomDropzoneProps {
   onDrop: (acceptedFiles: File[]) => void;
   children?: React.ReactNode;
+  noClick?: boolean;
 }
 
-export default function AppDropzone({ onDrop, children }: CustomDropzoneProps) {
+export default function AppDropzone({ onDrop, children, noClick = false }: CustomDropzoneProps) {
   const [isDragging, setIsDragging] = useState<boolean>(false);
   const { toast } = useToast();
 
@@ -17,6 +18,7 @@ export default function AppDropzone({ onDrop, children }: CustomDropzoneProps) {
     <div className="h-full w-full flex flex-col">
       <Dropzone
         onDrop={onDrop}
+        noClick={noClick}
         onDragEnter={() => setIsDragging(true)}
         onDragLeave={() => setIsDragging(false)}
         onDropAccepted={() => setIsDragging(false)}
@@ -24,7 +26,7 @@ export default function AppDropzone({ onDrop, children }: CustomDropzoneProps) {
           setIsDragging(false);
           toast({
             title: "Invalid file type!",
-            description: "Please upload a .png, .jpeg, .jpg, or .zip file",
+            description: "Ficheiros suportados: PNG, JPG, ZIP ou MP4",
             variant: "destructive",
           });
         }}
@@ -33,6 +35,7 @@ export default function AppDropzone({ onDrop, children }: CustomDropzoneProps) {
           "image/jpeg": [".jpeg"],
           "image/jpg": [".jpg"],
           "application/zip": [".zip"],
+          "video/mp4": [".mp4"],
         }}
       >
         {({ getRootProps, getInputProps }) => (

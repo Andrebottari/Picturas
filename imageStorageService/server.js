@@ -20,6 +20,9 @@ app.use("/video", videoRoutes);
 app.use("/video-result", videoDeleteRoutes);
 app.use("/video-source", videoSourceRoutes);
 
+//AB Porta utilizada pelo serviço de armazenamento no Docker.
+const PORT = Number(process.env.PORT || 11000);
+
 app.listen(PORT, () => {
   console.log(`Servidor rodando na porta ${PORT}`);
 });

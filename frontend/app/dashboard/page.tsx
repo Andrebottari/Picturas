@@ -3,63 +3,58 @@
 import AppDropzone from "@/components/app-dropzone";
 import NewProjectDialog from "@/components/dashboard-sidebar/new-project-dialog";
 import { extractZipImages } from "@/lib/utils";
-import { ImagePlus } from "lucide-react";
+import { Film, Images, UploadCloud } from "lucide-react";
 import { useState } from "react";
+import { useToast } from "@/hooks/use-toast";
 
+//AB Uma única zona de importação: identificar vídeo ou imagens automaticamente.
 export default function Dashboard() {
   const [files, setFiles] = useState<File[]>([]);
+  const { toast } = useToast();
 
-  const handleDrop = async (acceptedFiles: File[]) => {
-    const compatibleFileTypes = [
-      "image/png",
-      "image/jpeg",
-      "image/jpg",
-      "application/zip",
-    ];
-
-    // Extract images from zip files and filter out incompatible files
-    const compatibleFiles: File[] = [];
-    for (const file of acceptedFiles) {
-      if (file.type === "application/zip") {
-        const extractedFiles = await extractZipImages(file);
-        compatibleFiles.push(...extractedFiles);
-      } else if (compatibleFileTypes.includes(file.type)) {
-        compatibleFiles.push(file);
+  async function handleDrop(acceptedFiles: File[]) {
+    const videos = acceptedFiles.filter(file => file.name.toLowerCase().endsWith(".mp4"));
+    const images = acceptedFiles.filter(file => /\.(jpe?g|png)$/i.test(file.name));
+    const archives = acceptedFiles.filter(file => /\.zip$/i.test(file.name));
+    if (videos.length) {
+      if (acceptedFiles.length !== 1 || videos.length !== 1) {
+        toast({ title: "Seleciona apenas um vídeo MP4 de cada vez.", variant: "destructive" });
+        return;
       }
+      setFiles([videos[0]]);
+      return;
     }
-
-    // Handle duplicate names
-    const duplicateNames = new Set<string>();
-    files.forEach((file) => duplicateNames.add(file.name));
-    const uniqueFiles = compatibleFiles.map((file) => {
-      if (duplicateNames.has(file.name)) {
-        const newFile = new File(
-          [file],
-          `${file.name.split(".")[0]} (${duplicateNames.size}).${file.name.split(".")[1]}`,
-        );
-        duplicateNames.add(newFile.name);
-        return newFile;
-      }
-      duplicateNames.add(file.name);
-      return file;
-    });
-
-    setFiles(uniqueFiles);
-  };
+    const expanded = [...images];
+    for (const zip of archives) {
+      try { expanded.push(...await extractZipImages(zip)); }
+      catch { toast({ title: `Não foi possível abrir ${zip.name}`, variant: "destructive" }); }
+    }
+    if (expanded.length) setFiles(expanded);
+  }
 
   return (
-    <div className="p-8 h-full">
-      <NewProjectDialog files={files} setFiles={setFiles}>
-        <AppDropzone onDrop={handleDrop}>
-          <div className="flex flex-col gap-4 items-center justify-center max-w-[20rem]">
-            <ImagePlus size={100} />
-            <p className="text-2xl font-medium">
-              Pick a project or drag and drop some images or a .zip to create a
-              new one
-            </p>
-          </div>
-        </AppDropzone>
-      </NewProjectDialog>
+    <div className="h-full overflow-y-auto p-5 md:p-8">
+      <div className="mx-auto flex h-full max-w-5xl flex-col gap-5">
+        <div className="space-y-2 text-center">
+          <h1 className="text-2xl font-semibold">Começar a editar</h1>
+          <p className="text-muted-foreground">Escolhe ou arrasta um ficheiro. O PictuRAS identifica automaticamente se é uma imagem ou um vídeo.</p>
+        </div>
+        <div className="min-h-[360px] flex-1">
+          <NewProjectDialog files={files} setFiles={setFiles}>
+            <AppDropzone onDrop={handleDrop}>
+              <div className="flex max-w-lg flex-col items-center gap-5 py-10">
+                <div className="rounded-2xl bg-primary/10 p-5 text-primary"><UploadCloud className="size-11" /></div>
+                <div><p className="text-xl font-semibold text-foreground">Arrasta um ficheiro ou clica para escolher</p>
+                  <p className="mt-2 text-sm text-muted-foreground">O projeto será criado com o tipo adequado ao ficheiro.</p></div>
+                <div className="flex flex-wrap items-center justify-center gap-3 text-sm text-muted-foreground">
+                  <span className="inline-flex items-center gap-2 rounded-full border px-3 py-1"><Images className="size-4" />PNG, JPG, ZIP</span>
+                  <span className="inline-flex items-center gap-2 rounded-full border px-3 py-1"><Film className="size-4" />MP4 / H.264</span>
+                </div>
+              </div>
+            </AppDropzone>
+          </NewProjectDialog>
+        </div>
+      </div>
     </div>
   );
 }

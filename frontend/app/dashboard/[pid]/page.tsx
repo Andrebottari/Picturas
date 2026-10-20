@@ -1,6 +1,6 @@
 "use client";
 
-import { Download, LoaderCircle, OctagonAlert, Play } from "lucide-react";
+import { Download, Film, Images, LoaderCircle, OctagonAlert, Play } from "lucide-react";
 import { fetchSharedProject, resolveShareLink } from "@/lib/projects";
 import { ProjectImageList } from "@/components/project-page/project-image-list";
 import { ViewToggle } from "@/components/project-page/view-toggle";
@@ -45,6 +45,7 @@ import { useUpdateSession } from "@/lib/mutations/session";
 import { getErrorMessage } from "@/lib/error-messages";
 import { PresetsDialog } from "@/components/presets/presets-dialog";
 import { AiAssistantDialog } from "@/components/assistant/ai-assistant-dialog";
+import { VideoFiltersPanel } from "@/components/project-page/video-filters-panel";
 
 export default function Project({
   params,
@@ -60,6 +61,8 @@ export default function Project({
   const searchParams = useSearchParams();
   const view = searchParams.get("view") ?? "grid";
   const mode = searchParams.get("mode") ?? "edit";
+  //AB Separar a experiência de vídeo do editor de imagens.
+  const videoEditor = searchParams.get("editor") === "video";
   // se vier ?owner=... usamos esse userId, senão usamos o próprio utilizador (owner normal)
   const ownerId = searchParams.get("owner") ?? session.user._id;
   const shareId = searchParams.get("share") ?? undefined;
@@ -609,21 +612,34 @@ const handleCancel = () => {
           </div>
         )}
 
+        {/* AB: navegação visível entre os editores, sem misturar ferramentas de imagem e vídeo. */}
+        {!shareId && session.user._id === ownerId && (
+          <nav aria-label="Tipo de editor" className="flex shrink-0 gap-2 border-b bg-card px-4 py-2">
+            <Button type="button" size="sm" variant={!videoEditor ? "default" : "outline"} onClick={() => {
+              const q = new URLSearchParams(searchParams.toString()); q.delete("editor");
+              router.push(`${path}${q.size ? `?${q}` : ""}`);
+            }}><Images className="mr-2 size-4" />Imagens</Button>
+            <Button type="button" size="sm" variant={videoEditor ? "default" : "outline"} onClick={() => {
+              const q = new URLSearchParams(searchParams.toString()); q.set("editor", "video");
+              router.push(`${path}?${q}`);
+            }}><Film className="mr-2 size-4" />Vídeos</Button>
+          </nav>
+        )}
         {/* Header */}
         <div className="flex flex-col xl:flex-row justify-center items-start xl:items-center xl:justify-between border-b border-sidebar-border py-2 px-2 md:px-3 xl:px-4 h-fit gap-2">
           <div className="flex items-center justify-between w-full xl:w-auto gap-2">
             <h1 className="text-lg font-semibold truncate">
               {project.data.name}
             </h1>
-            <div className="flex items-center gap-2 xl:hidden">
+            {!videoEditor && <div className="flex items-center gap-2 xl:hidden">
               <ViewToggle />
               <ModeToggle />
-            </div>
+            </div>}
           </div>
           <div className="flex items-center justify-between w-full xl:w-auto gap-2">
             <SidebarTrigger variant="outline" className="h-9 w-10 lg:hidden" />
                       <div className="flex items-center gap-2 flex-wrap justify-end xl:justify-normal w-full xl:w-auto">
-              {mode !== "results" && (
+              {!videoEditor && mode !== "results" && (
                 <>
                   <Button
                     disabled={
@@ -726,7 +742,7 @@ const handleCancel = () => {
                 </>
               )}
 
-              <DropdownMenu>
+              {!videoEditor && <DropdownMenu>
                 <DropdownMenuTrigger asChild>
                   <Button
                     variant="outline"
@@ -815,24 +831,34 @@ const handleCancel = () => {
                               : "Download images (PDF)"}
                         </DropdownMenuItem>
                       </DropdownMenuContent>
-                    </DropdownMenu>
+                    </DropdownMenu>}
 
-              <div className="hidden xl:flex items-center gap-2">
+              {!videoEditor && <div className="hidden xl:flex items-center gap-2">
                 <ViewToggle />
                 <ModeToggle />
-              </div>
+              </div>}
             </div>
           </div>
         </div>
+        {/* AB: UC-03 visível apenas ao proprietário; preserva o editor de imagens. */}
+        {videoEditor && !shareId && session.user._id === ownerId && (
+          <VideoFiltersPanel
+            userId={session.user._id}
+            projectId={pid}
+            token={session.token}
+            version={project.data.version}
+            onUploaded={async () => { await project.refetch(); }}
+          />
+        )}
         {/* Main Content */}
 
-        <div className="h-full overflow-x-hidden flex">
+        {!videoEditor && <div className="h-full overflow-x-hidden flex">
         <Toolbar />
         <ProjectImageList
           setCurrentImageId={setCurrentImage}
           results={projectResults.data}
         />
-      </div>
+      </div>}
       </div>
       <Transition
         show={processing}

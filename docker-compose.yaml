@@ -154,7 +154,8 @@ services:
     volumes:
       - image_data:/app/images
       #AB O worker recebe apenas o certificado público.
-      - /tmp/picturas-uc03-tls/projects.crt:/run/picturas-tls/projects.crt:ro
+      - ${HOME}/.local/share/picturas-uc03/tls/projects.crt:/run/picturas-tls/projects.crt:ro
+      - ${HOME}/.local/share/picturas-uc03/tls/projects.key:/run/picturas-tls/projects.key:ro
 
   users_mongoDB:
     image: mongo:4.4
@@ -272,6 +273,8 @@ services:
         condition: service_healthy
     volumes:
       - image_data:/app/images
+      #AB Certificado público para comunicação HTTPS segura com projects.
+      - ${HOME}/.local/share/picturas-uc03/tls/projects.crt:/run/picturas-tls/projects.crt:ro
 
   brightness_tool:
     build:
@@ -298,19 +301,22 @@ services:
       rabbitmq:
         condition: service_healthy
     environment:
+    
       RABBITMQ_HOST: rabbitmq
       RABBITMQ_PORT: "5672"
       RABBITMQ_USER: user
       RABBITMQ_PASS: password
       #AB Endpoint interno para reclamar processamentos de vídeo.
       VIDEO_CLAIM_URL: https://projects:9001/internal/video/claim
-
+      VIDEO_PROJECTS_CA_FILE: /run/picturas-tls/projects.crt
       #AB Credencial partilhada com o serviço projects.
       VIDEO_INTERNAL_SECRET: ${VIDEO_INTERNAL_SECRET:?VIDEO_INTERNAL_SECRET tem de estar definida}
 
 
     volumes:
       - image_data:/app/images
+      #AB Certificado público para comunicação segura com projects.
+      - ${HOME}/.local/share/picturas-uc03/tls/projects.crt:/run/picturas-tls/projects.crt:ro
     networks:
       - elk
 
@@ -581,5 +587,3 @@ volumes:
   image_data:
   seaweedfs_data:
   subscription_data:
-
-
