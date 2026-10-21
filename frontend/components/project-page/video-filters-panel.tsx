@@ -5,7 +5,7 @@ import axios from "axios";
 import {
   Check, CheckCircle2, CircleAlert, Clapperboard, Clock3,
   Film, LoaderCircle, Play, RotateCcw, SlidersHorizontal,
-  Sparkles, UploadCloud, Video, X,
+  Sparkles, UploadCloud, Video, X, Download, Eye,
 } from "lucide-react";
 import { api } from "@/lib/axios";
 import { retirarVideoPendente } from "@/lib/pending-video";
@@ -79,8 +79,11 @@ export function VideoFiltersPanel({ userId, projectId, token, version, onUploade
   const [compareOriginal, setCompareOriginal] = useState(false);
   const [state, setState] = useState<ProcessState | null>(null);
   const [notice, setNotice] = useState("");
+  const [resultUrl, setResultUrl] = useState<string | null>(null);
+  const [resultBusy, setResultBusy] = useState(false);
   const [error, setError] = useState("");
   const picker = useRef<HTMLInputElement>(null);
+  const resultUrlRef = useRef<string | null>(null);
   const currentVersion = useRef(version);
   const alive = useRef(true);
   const base = `projects/${encodeURIComponent(userId)}/${encodeURIComponent(projectId)}/video`;
@@ -109,7 +112,69 @@ export function VideoFiltersPanel({ userId, projectId, token, version, onUploade
     setPreviewUrl(url);
     return () => URL.revokeObjectURL(url);
   }, [file]);
-  useEffect(() => () => { alive.current = false; }, []);
+  useEffect(() => () => {
+    alive.current = false;
+    if (resultUrlRef.current) URL.revokeObjectURL(resultUrlRef.current);
+  }, []);
+
+  //AB Recuperar o processamento ao regressar ao projeto, sem guardar JWT no navegador.
+  useEffect(() => {
+    const processId = window.localStorage.getItem(`picturas-uc03-process:${projectId}`);
+    if (!processId || !/^[a-f0-9]{24}$/i.test(processId)) return;
+    let active = true;
+    api.get<ProcessState>(`${base}/process/${processId}`, { headers })
+      .then(response => { if (active) setState(response.data); })
+      .catch(() => { if (active) window.localStorage.removeItem(`picturas-uc03-process:${projectId}`); });
+    return () => { active = false; };
+    //AB Só consultar o último processo no início da sessão deste projeto.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [projectId, token]);
+
+  function clearResult() {
+    if (resultUrlRef.current) URL.revokeObjectURL(resultUrlRef.current);
+    resultUrlRef.current = null;
+    setResultUrl(null);
+  }
+
+  //AB Fetch com JWT, nunca expor segredo S3 no browser.
+  async function getResult(): Promise<string | null> {
+    if (!state || state.status !== "completed") return null;
+    if (resultUrlRef.current) return resultUrlRef.current;
+    setResultBusy(true); setError("");
+    try {
+      const response = await api.get<Blob>(`${base}/process/${encodeURIComponent(state.processId)}/result`, {
+        headers, responseType: "blob", timeout: 180000,
+      });
+      const blob = response.data;
+      if (!blob || blob.size === 0) throw new Error("O resultado recebido está vazio.");
+      const url = URL.createObjectURL(new Blob([blob], { type: "video/mp4" }));
+      resultUrlRef.current = url;
+      return url;
+    } catch (err) {
+      setError(`Falha ao obter o vídeo processado: ${errorText(err)}`);
+      return null;
+    } finally { setResultBusy(false); }
+  }
+
+  //AB Transferir o MP4 não deve abrir outro leitor nem mudar o layout.
+  async function downloadResult() {
+    if (!state || state.status !== "completed") return;
+    const url = await getResult();
+    if (!url) return;
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `picturas-${state.processId}.mp4`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+  }
+
+  //AB Mostrar o resultado no leitor principal, sem empilhar dois vídeos.
+  async function showProcessedResult() {
+    const url = await getResult();
+    if (url) setResultUrl(url);
+  }
+
 
   useEffect(() => {
     if (!state || !running) return;
@@ -138,7 +203,7 @@ export function VideoFiltersPanel({ userId, projectId, token, version, onUploade
       setError("O vídeo não pode exceder 500 MB.");
       return;
     }
-    setError(""); setNotice(""); setFile(next); setUploadedFile(null); setState(null); setDuration(null);
+    clearResult(); setError(""); setNotice(""); setFile(next); setUploadedFile(null); setState(null); setDuration(null);
   }
   function toggleFilter(name: FilterName) {
     setSelected(old => old.includes(name) ? old.filter(item => item !== name) : [...old, name]);
@@ -159,7 +224,9 @@ export function VideoFiltersPanel({ userId, projectId, token, version, onUploade
     const newVersion = Number(result.data?.projectVersion ?? result.headers["x-project-version"]);
     if (Number.isFinite(newVersion)) currentVersion.current = newVersion;
     setUploadedFile(videoFile.name);
+    clearResult();
     setState(null);
+    window.localStorage.removeItem(`picturas-uc03-process:${projectId}`);
     await onUploaded();
   }
 
@@ -196,11 +263,14 @@ export function VideoFiltersPanel({ userId, projectId, token, version, onUploade
         headers: { ...headers, "X-Project-Version": String(currentVersion.current) },
         timeout: 180000,
       });
+      clearResult();
       setState(response.data);
+      window.localStorage.setItem(`picturas-uc03-process:${projectId}`, response.data.processId);
       setNotice("Pedido enviado. O estado é atualizado automaticamente.");
     } catch (err) {
       if (axios.isAxiosError(err) && err.response?.data?.publicationUncertain && err.response.data.processId) {
         setState({ processId: err.response.data.processId, status: "pending" });
+        window.localStorage.setItem(`picturas-uc03-process:${projectId}`, err.response.data.processId);
         setNotice("Publicação por confirmar; vamos acompanhar o estado antes de repetir.");
       } else { setNotice(""); setError(errorText(err)); }
     } finally { setBusy(false); }
@@ -218,7 +288,7 @@ export function VideoFiltersPanel({ userId, projectId, token, version, onUploade
   }
 
   return (
-    <section aria-label="Editor de vídeo UC-03" className="flex min-h-0 flex-1 flex-col bg-background">
+    <section aria-label="Editor de vídeo UC-03" className="flex min-h-0 min-w-0 flex-1 flex-col overflow-y-auto overscroll-contain bg-background">
       {/* AB: cabeçalho compacto, no padrão das ferramentas do PictuRAS. */}
       <header className="flex flex-wrap items-center justify-between gap-3 border-b px-4 py-3 md:px-6">
         <div className="flex min-w-0 items-center gap-3">
@@ -231,18 +301,23 @@ export function VideoFiltersPanel({ userId, projectId, token, version, onUploade
         </div>
       </header>
 
-      <div className="grid min-h-0 flex-1 grid-cols-1 lg:grid-cols-[minmax(0,1fr)_310px] xl:grid-cols-[minmax(0,1fr)_340px]">
+      <div className="grid min-w-0 flex-none grid-cols-1 lg:grid-cols-[minmax(0,1fr)_310px] xl:grid-cols-[minmax(0,1fr)_340px]">
         {/* AB: área de trabalho visual com proporção 16:9 e controlos nativos acessíveis. */}
         <main className="flex min-w-0 flex-col gap-4 bg-muted/20 p-4 md:p-6">
           <div className="flex items-center justify-between gap-2"><div><h3 className="text-sm font-semibold">Pré-visualização dos filtros</h3><p className="text-xs text-muted-foreground">Resultado aproximado em tempo real · exportação final por FFmpeg</p></div>{file && <span className="hidden rounded-md border bg-background px-2 py-1 text-xs text-muted-foreground sm:inline">{displaySize(file.size)}</span>}</div>
-          <div className="flex min-h-[220px] w-full flex-1 items-center justify-center overflow-hidden rounded-xl border border-border bg-zinc-950 p-3 shadow-sm sm:min-h-[360px]">
-            {previewUrl ? (
-              <video key={previewUrl} className="max-h-[min(55vh,550px)] w-full rounded-md object-contain" style={{ filter: previewFilter }} src={previewUrl} controls playsInline preload="metadata" aria-label="Pré-visualização do vídeo original" onLoadedMetadata={event => setDuration(event.currentTarget.duration)} />
+          {resultUrl && <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg border bg-card px-3 py-2">
+            <p className="text-sm font-semibold">Resultado final processado pelo FFmpeg</p>
+            <Button type="button" size="sm" variant="outline" onClick={() => setResultUrl(null)}>Voltar à pré-visualização</Button>
+          </div>}
+          {/* AB Um único leitor responsivo, incluindo vídeos verticais: evitar sobreposição no rodapé. */}
+          <div className="flex w-full min-w-0 shrink-0 items-center justify-center overflow-hidden rounded-xl border border-border bg-zinc-950 p-3 shadow-sm">
+            {resultUrl || previewUrl ? (
+              <video key={resultUrl ?? previewUrl} className="block h-auto max-h-[55vh] w-full max-w-full rounded-md object-contain" style={{ filter: resultUrl ? "none" : previewFilter }} src={resultUrl ?? previewUrl ?? undefined} controls playsInline preload="metadata" aria-label={resultUrl ? "Reproduzir vídeo processado" : "Pré-visualização do vídeo original"} onLoadedMetadata={event => { if (!resultUrl) setDuration(event.currentTarget.duration); }} />
             ) : (
               <div className="flex max-w-sm flex-col items-center gap-3 text-center text-zinc-300"><span className="rounded-2xl bg-white/10 p-5"><Video className="size-10" /></span><p className="text-base font-medium text-white">O teu vídeo aparece aqui</p><p className="text-sm text-zinc-400">Escolhe um MP4 para pré-visualizar, configurar e aplicar os filtros.</p><Button type="button" variant="secondary" onClick={() => picker.current?.click()}><UploadCloud className="mr-2 size-4" />Selecionar MP4</Button></div>
             )}
           </div>
-          {previewUrl && <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg border bg-card p-3">
+          {previewUrl && !resultUrl && <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg border bg-card p-3">
             <p className="text-xs text-muted-foreground">Ajusta os filtros com o vídeo a reproduzir. A pré-visualização é aproximada e pode diferir do FFmpeg.</p>
             <Button type="button" size="sm" variant={compareOriginal ? "default" : "outline"}
               onPointerDown={() => setCompareOriginal(true)} onPointerUp={() => setCompareOriginal(false)}
@@ -282,11 +357,15 @@ export function VideoFiltersPanel({ userId, projectId, token, version, onUploade
         </aside>
       </div>
 
-      <footer className="border-t bg-card px-4 py-4 md:px-6">
+      <footer className="shrink-0 border-t bg-card px-4 pb-8 pt-4 md:px-6 md:pb-8">
         {state && <div className="mb-3 space-y-2"><div className="flex items-center justify-between text-xs"><span className="inline-flex items-center gap-2 font-medium">{running ? <LoaderCircle className="size-3.5 animate-spin" /> : state.status === "completed" ? <CheckCircle2 className="size-3.5 text-emerald-500" /> : <Clock3 className="size-3.5" />}{statusLabel[state.status]}</span>{typeof state.progress === "number" && <span className="tabular-nums text-muted-foreground">{state.progress}%</span>}</div><Progress value={typeof state.progress === "number" ? state.progress : running ? 12 : state.status === "completed" ? 100 : 0} className="h-1.5" /></div>}
         {error && <p className="mb-3 flex items-start gap-2 rounded-lg border border-destructive/30 bg-destructive/10 p-3 text-sm text-destructive" role="alert"><CircleAlert className="mt-0.5 size-4 shrink-0" />{error}</p>}
         {state?.status === "failed" && <p className="mb-3 text-sm text-destructive" role="alert">{state.errorMessage || "O processamento falhou."}</p>}
-        {state?.status === "completed" && <p className="mb-3 text-xs text-muted-foreground">O resultado foi guardado. A pré-visualização e o download do MP4 final aguardam uma rota autenticada de leitura.</p>}
+        {state?.status === "completed" && <div className="mb-3 flex flex-wrap items-center gap-2 rounded-lg border p-3">
+          <span className="mr-auto text-sm">O MP4 processado está disponível.</span>
+          <Button type="button" variant="outline" disabled={resultBusy} onClick={() => void showProcessedResult()}><Eye className="mr-2 size-4" />{resultBusy ? "A carregar resultado..." : "Ver vídeo processado"}</Button>
+          <Button type="button" disabled={resultBusy} onClick={() => void downloadResult()}><Download className="mr-2 size-4" />Descarregar MP4</Button>
+        </div>}
         {notice && <p className="mb-3 text-xs text-muted-foreground" role="status">{notice}</p>}
         <div className="flex flex-wrap items-center justify-between gap-3"><div className="text-xs text-muted-foreground"><span className="font-medium text-foreground">1.</span> Escolher vídeo <span className="mx-1">→</span> <span className="font-medium text-foreground">2.</span> Ajustar filtros <span className="mx-1">→</span> <span className="font-medium text-foreground">3.</span> Aplicar (upload automático)</div><div className="flex flex-wrap items-center gap-2">{running && <Button type="button" variant="outline" disabled={busy} onClick={cancel}><X className="mr-2 size-4" />Cancelar</Button>}<Button type="button" variant="outline" disabled={!file || busy || running || (uploadedFile === file?.name)} onClick={upload}>{busy ? <LoaderCircle className="mr-2 size-4 animate-spin" /> : <UploadCloud className="mr-2 size-4" />}Carregar vídeo</Button><Button type="button" disabled={!file || !selected.length || busy || running} onClick={processVideo}>{busy ? <LoaderCircle className="mr-2 size-4 animate-spin" /> : <Play className="mr-2 size-4" />}Aplicar filtros</Button></div></div>
       </footer>

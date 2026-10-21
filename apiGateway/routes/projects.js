@@ -235,6 +235,36 @@ router.delete(
   }
 );
 
+//AB UC-03: o Gateway revalida o JWT e encaminha o MP4 sem o guardar em memória.
+router.get("/:user/:project/video/process/:processId/result", auth.checkToken, async (req, res) => {
+  const { user, project, processId } = req.params;
+  try {
+    const resposta = await axios.get(
+      `${projectsURL}${encodeURIComponent(user)}/${encodeURIComponent(project)}/video/process/${encodeURIComponent(processId)}/result`,
+      { httpsAgent, responseType: "stream", timeout: 120000, maxRedirects: 0,
+        headers: { Authorization: req.headers.authorization } }
+    );
+    res.set({
+      "Content-Type": "video/mp4", "Cache-Control": "private, no-store",
+      "X-Content-Type-Options": "nosniff",
+      "Content-Disposition": resposta.headers["content-disposition"] || `attachment; filename="picturas-${processId}.mp4"`,
+    });
+    if (resposta.headers["content-length"]) res.set("Content-Length", resposta.headers["content-length"]);
+    resposta.data.on("error", err => { console.error("[GATEWAY VIDEO RESULT]", err.message); res.destroy(err); });
+    res.on("close", () => { if (!res.writableEnded) resposta.data.destroy(); });
+    resposta.data.pipe(res);
+  } catch (err) {
+    console.error("[GATEWAY VIDEO RESULT]", err.message);
+    if (res.headersSent) return res.destroy(err);
+    const code = err.response?.status;
+    //AB Não encaminhar um stream de erro JSON como resposta binária.
+    if (err.response?.data?.destroy) err.response.data.destroy();
+    return res.status([400,401,403,404,409].includes(code) ? code : 502).json({
+      message: code === 404 ? "Resultado não encontrado." : "Não foi possível descarregar o MP4.",
+    });
+  }
+});
+
 const projectsURL = "https://projects:9001/";
 
 function forwardAxiosError(res, err, fallbackMsg) {

@@ -404,6 +404,60 @@ router.get(
   }
 );
 
+//AB UC-03: apenas o proprietário autenticado pode ler o resultado de uma execução concluída.
+//AB O nome S3 nunca é fornecido pelo cliente: vem do registo validado no MongoDB.
+router.get(
+  "/:user/:project/video/process/:processId/result",
+  requireVideoOwner,
+  requireVideoProjectOwner,
+  async (req, res) => {
+    const { user, project, processId } = req.params;
+    if (!/^[a-f0-9]{24}$/i.test(processId)) {
+      return res.status(400).json({ message: "Identificador de processamento inválido." });
+    }
+    try {
+      const processo = await VideoProcess.findOne({
+        _id: processId, user_id: user, project_id: project, status: "completed",
+      }).lean();
+      if (!processo) {
+        return res.status(404).json({ message: "Resultado de vídeo não encontrado." });
+      }
+      const key = processo.output_video_key;
+      const match = typeof key === "string" &&
+        key.match(new RegExp(`^${project}/out/([a-f0-9]{64}\\.mp4)$`));
+      if (!match) {
+        return res.status(409).json({ message: "Resultado de vídeo inválido ou indisponível." });
+      }
+      const segredo = process.env.VIDEO_INTERNAL_SECRET;
+      if (!segredo) return res.status(503).json({ message: "Armazenamento indisponível." });
+      const axios = require("axios");
+      const resposta = await axios.get(
+        `${process.env.VIDEO_STORAGE_URL || "http://img_storage:11000"}/video-output/${user}/${project}/${match[1]}`,
+        { responseType: "stream", timeout: 120000, maxRedirects: 0,
+          headers: { "X-Video-Internal-Secret": segredo } }
+      );
+      res.set({
+        "Content-Type": "video/mp4", "Cache-Control": "private, no-store",
+        "X-Content-Type-Options": "nosniff",
+        "Content-Disposition": `attachment; filename="picturas-${processId}.mp4"`,
+      });
+      if (resposta.headers["content-length"]) {
+        res.set("Content-Length", resposta.headers["content-length"]);
+      }
+      resposta.data.on("error", (err) => { console.error("[VIDEO RESULT] Stream:", err.message); res.destroy(err); });
+      res.on("close", () => { if (!res.writableEnded) resposta.data.destroy(); });
+      resposta.data.pipe(res);
+    } catch (err) {
+      console.error("[VIDEO RESULT] Falha:", err.message);
+      if (res.headersSent) return res.destroy(err);
+      const code = err.response?.status;
+      return res.status(code === 404 ? 404 : 502).json({
+        message: code === 404 ? "Vídeo processado não encontrado." : "Não foi possível obter o MP4 processado.",
+      });
+    }
+  }
+);
+
 //AB Cancelar um processamento de vídeo ainda não concluído.
 router.delete(
   "/:user/:project/video/process/:processId",
