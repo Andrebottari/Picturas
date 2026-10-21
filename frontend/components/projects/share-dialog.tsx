@@ -23,7 +23,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { Copy } from "lucide-react";
+import { Copy, Share2 } from "lucide-react";
 import type { ShareLink } from "@/lib/projects";
 import { useUnsavedChanges } from "@/providers/project-provider";
 import { toast } from "@/hooks/use-toast";
@@ -36,7 +36,6 @@ type Props = {
 
 export function ShareProjectDialog({ projectId, projectVersion }: Props) {
   const [open, setOpen] = useState(false);
-  const [lastCreatedUrl, setLastCreatedUrl] = useState<string | null>(null);
   const session = useSession();
 
   const [vLocal, setVLocal] = useState<number>(projectVersion);
@@ -95,7 +94,6 @@ export function ShareProjectDialog({ projectId, projectVersion }: Props) {
       { permission, projectVersion: getLatestVersion() },
       {
         onSuccess: (resp) => {
-          setLastCreatedUrl(resp.data.url);
           const newV = Number(resp.newVersionHeader);
           if (Number.isFinite(newV)) setVLocal(newV);
         },
@@ -104,8 +102,19 @@ export function ShareProjectDialog({ projectId, projectVersion }: Props) {
 
   };
 
-  const handleCopy = (url: string) => {
-    navigator.clipboard.writeText(url);
+  const activeLinks = (links ?? []).filter((link: ShareLink) => !link.revoked);
+
+  const handleCopy = async (url: string) => {
+    try {
+      await navigator.clipboard.writeText(url);
+      toast({ title: "Link copiado", description: "O link de partilha foi copiado." });
+    } catch {
+      toast({
+        variant: "destructive",
+        title: "Não foi possível copiar o link",
+        description: "Seleciona o link e copia-o manualmente.",
+      });
+    }
   };
 
   return (
@@ -114,7 +123,7 @@ export function ShareProjectDialog({ projectId, projectVersion }: Props) {
         {/* opcional: indicador visual de unsaved aqui */}
         <Button variant="outline">
           <span className="inline-flex items-center gap-1">
-            Share
+            <Share2 className="mr-1 size-4" />Partilhar
             {hasUnsavedChanges && (
               <span className="inline-block h-2 w-2 rounded-full bg-amber-500" />
             )}
@@ -123,11 +132,11 @@ export function ShareProjectDialog({ projectId, projectVersion }: Props) {
       </DialogTrigger>
       <DialogContent className="space-y-4">
         <DialogHeader>
-          <DialogTitle>Share project</DialogTitle>
+          <DialogTitle>Partilhar projeto</DialogTitle>
         </DialogHeader>
 
         <div className="space-y-2">
-          <p className="text-sm font-medium">Generate new link</p>
+          <p className="text-sm font-medium">Criar link de partilha</p>
           <div className="flex gap-2 items-center">
             <Select
               value={permission}
@@ -137,53 +146,41 @@ export function ShareProjectDialog({ projectId, projectVersion }: Props) {
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
-                <SelectItem value="read">View only</SelectItem>
-                <SelectItem value="edit">Can edit</SelectItem>
+                <SelectItem value="read">Apenas visualizar</SelectItem>
+                <SelectItem value="edit">Pode editar</SelectItem>
               </SelectContent>
             </Select>
             <Button
               onClick={handleCreate}
               disabled={createLink.isPending}
             >
-              {createLink.isPending ? "Creating..." : "Create link"}
+              {createLink.isPending ? "A criar..." : "Criar link"}
             </Button>
           </div>
-          {lastCreatedUrl && (
-            <div className="mt-2 flex items-center gap-2 text-xs break-all border rounded px-2 py-1">
-              <span className="flex-1">{lastCreatedUrl}</span>
-              <Button
-                size="icon"
-                variant="ghost"
-                onClick={() => handleCopy(lastCreatedUrl)}
-              >
-                <Copy className="h-4 w-4" />
-              </Button>
-            </div>
-          )}
         </div>
 
         <div className="space-y-2">
-          <p className="text-sm font-medium">Active links</p>
+          <p className="text-sm font-medium">Links de partilha</p>
           {isLoading && (
-            <p className="text-xs text-muted-foreground">Loading...</p>
+            <p className="text-xs text-muted-foreground">A carregar...</p>
           )}
 
-          {!isLoading && (!links || links.length === 0) && (
+          {!isLoading && (activeLinks.length === 0) && (
             <p className="text-xs text-muted-foreground">
-              No links created yet.
+              Ainda não existem links de partilha.
             </p>
           )}
 
-          {!isLoading && links && links.length > 0 && (
+          {!isLoading && activeLinks.length > 0 && (
             <div className="space-y-2 max-h-48 overflow-y-auto text-xs">
-              {links.map((l: ShareLink) => (
+              {activeLinks.map((l: ShareLink) => (
                 <div
                   key={l.id}
                   className="flex flex-col gap-1 border rounded px-2 py-1"
                 >
                   <div className="flex justify-between items-center">
                     <span>
-                      {l.permission.toUpperCase()}{" "}
+                      {l.permission === "edit" ? "Pode editar" : "Apenas visualizar"}{" "}
                       {l.revoked && (
                         <span className="ml-1 text-red-500">(revoked)</span>
                       )}
@@ -205,13 +202,13 @@ export function ShareProjectDialog({ projectId, projectVersion }: Props) {
                         }
                         disabled={revokeLink.isPending}
                       >
-                        Revoke
+                        Revogar
                       </Button>
                     )}
                   </div>
                   <div className="flex items-center gap-2 break-all">
                     <span className="flex-1">
-                      {window.location.origin}/share/{l.id}
+                      {typeof window !== "undefined" ? window.location.origin : ""}/share/{l.id}
                     </span>
                     <Button
                       size="icon"

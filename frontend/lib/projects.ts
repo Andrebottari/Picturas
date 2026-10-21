@@ -143,6 +143,7 @@ export const resolveShareLink = async (shareId: string) => {
     ownerId: string;
     permission: "read" | "edit";
     projectName?: string;
+    isVideo?: boolean;
     
   };
 };

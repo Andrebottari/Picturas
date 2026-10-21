@@ -34,6 +34,15 @@ const userSchema = new mongoose.Schema({
     required: true,
   },
   operations: { type: [daySchema], required: true, default: [] },
+  // UC-03: identificadores de processamento permitem debito/reembolso idempotente.
+  videoQuotaReservations: {
+    type: [new mongoose.Schema({
+      id: { type: String, required: true },
+      day: { type: Date, required: true },
+      status: { type: String, enum: ["reserved", "refunded"], default: "reserved" },
+    }, { _id: false })],
+    default: [],
+  },
 });
 
 // Virtual "email" para aceder ao valor desencriptado
@@ -62,6 +71,7 @@ userSchema.set("toJSON", {
     delete ret.email_encrypted;
     delete ret.email_hash;
     delete ret.password_hash;
+    delete ret.videoQuotaReservations;
     return ret;
   },
 });

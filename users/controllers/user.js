@@ -26,7 +26,9 @@ module.exports.getOne = async (user_id) => {
 module.exports.getOneEmail = async (email) => {
   const emailHash = hashEmail(email);
   const user = await User.findOne({ email_hash: emailHash }).exec();
-  return user ? user.toJSON() : null;
+  // O toJSON() remove password_hash; o login precisa do hash para bcrypt.compare.
+  // O hash permanece apenas na resposta interna do controller e é retirado pela rota.
+  return user ? { ...user.toJSON(), password_hash: user.password_hash } : null;
 };
 
 

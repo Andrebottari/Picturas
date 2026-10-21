@@ -27,7 +27,7 @@ module.exports.checkToken = (req, res, next) => {
       const shareId = req.query?.share;
 
       // Só exigimos match no caso "normal" (sem share)
-      if (!shareId && user_id !== req.params.user) {
+      if (req.params.user !== undefined && !shareId && user_id !== req.params.user) {
         res.status(401).jsonp(`Request's user and JWT's user don't match`);
         return;
       }

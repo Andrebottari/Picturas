@@ -1,12 +1,10 @@
 "use client";
 
-import { use, useEffect, useMemo, useState } from "react";
+import { use, useEffect, useState } from "react";
+import axios from "axios";
 import Link from "next/link";
-import {
-  resolveShareLink,
-  fetchSharedProject,
-  type SharedProject,
-} from "@/lib/projects";
+import { useRouter } from "next/navigation";
+import { resolveShareLink } from "@/lib/projects";
 import { useSession } from "@/providers/session-provider";
 
 type Props = {
@@ -18,180 +16,108 @@ type ShareInfo = {
   ownerId: string;
   permission: "read" | "edit";
   projectName?: string;
+  isVideo?: boolean;
 };
 
 export default function SharePage({ params }: Props) {
   const { linkId } = use(params);
+  const router = useRouter();
   const session = useSession();
+  const isAuthed = session.user.type !== "anonymous";
 
   const [info, setInfo] = useState<ShareInfo | null>(null);
-  const [project, setProject] = useState<SharedProject | null>(null);
   const [loading, setLoading] = useState(true);
-  const [error, setError] = useState(false);
-
-  const isAuthed = session.user.type !== "anonymous";
+  const [error, setError] = useState<"invalid" | "service" | null>(null);
 
   useEffect(() => {
     let cancelled = false;
 
-    async function load() {
+    async function validateAndRedirect() {
+      setLoading(true);
       try {
-        // 1) público: valida link + permission (sem JWT)
-        const i = await resolveShareLink(linkId);
+        // Validar sempre a partilha no servidor antes de encaminhar.
+        const share = await resolveShareLink(linkId);
         if (cancelled) return;
+        setInfo(share);
+        setError(null);
 
-        setInfo(i);
-        setError(false);
-
-        // 2) privado: só se estiver autenticado
         if (isAuthed) {
-          const p = await fetchSharedProject(linkId, session.token);
-          if (cancelled) return;
-          setProject(p);
-        } else {
-          setProject(null);
+          const target = `/dashboard/${encodeURIComponent(share.projectId)}` +
+            `?owner=${encodeURIComponent(share.ownerId)}` +
+            `&share=${encodeURIComponent(linkId)}` +
+            (share.isVideo ? "&editor=video" : "");
+          router.replace(target);
         }
-
-        setLoading(false);
-      } catch {
-        if (!cancelled) {
-          setInfo(null);
-          setProject(null);
-          setError(true);
-          setLoading(false);
-        }
+      } catch (err) {
+        if (cancelled) return;
+        const status = axios.isAxiosError(err) ? err.response?.status : undefined;
+        setInfo(null);
+        setError(status === 404 || status === 410 ? "invalid" : "service");
+      } finally {
+        if (!cancelled) setLoading(false);
       }
     }
 
-    load();
-    const interval = setInterval(load, 5000);
+    validateAndRedirect();
+    return () => { cancelled = true; };
+  }, [linkId, isAuthed, router]);
 
-    return () => {
-      cancelled = true;
-      clearInterval(interval);
-    };
-  }, [linkId, isAuthed, session.token]);
-
-  if (loading) {
-    return (
-      <main className="p-8 flex items-center justify-center">
-        <div className="inline-flex items-center">
-          <span className="animate-spin mr-2">⏳</span>
-          <span>Loading...</span>
-        </div>
-      </main>
-    );
-  }
-
-  if (error || !info) {
+  if (error === "invalid") {
     return (
       <main className="p-8 space-y-4">
-        <h1 className="text-2xl font-semibold">Invalid or revoked link</h1>
-        <p className="text-sm text-muted-foreground">
-          This share link is no longer valid.
-        </p>
-        <Link href="/dashboard" className="underline text-blue-500">
-          Go back to dashboard
-        </Link>
+        <h1 className="text-2xl font-semibold">Link inválido ou revogado</h1>
+        <p>Esta partilha já não está disponível.</p>
+        <Link href="/dashboard" className="underline text-blue-500">Voltar ao Dashboard</Link>
       </main>
     );
   }
 
-  // URL do editor no dashboard
-  const editorUrl = `/dashboard/${info.projectId}?owner=${info.ownerId}&share=${linkId}`;
-  const nextParam = encodeURIComponent(editorUrl);
+  if (error === "service") {
+    return (
+      <main className="p-8 space-y-4">
+        <h1 className="text-2xl font-semibold">Não foi possível verificar a partilha</h1>
+        <p>Não foi possível contactar o serviço de partilhas. O link pode continuar válido.</p>
+        <button type="button" className="underline text-blue-500" onClick={() => window.location.reload()}>
+          Tentar novamente
+        </button>
+      </main>
+    );
+  }
+
+  if (loading || (info && isAuthed)) {
+    return (
+      <main className="p-8 flex items-center justify-center" role="status" aria-live="polite">
+        <span className="animate-spin mr-2" aria-hidden="true">⏳</span>
+        <span>A abrir projeto partilhado…</span>
+      </main>
+    );
+  }
+
+  if (!info) {
+    return <main className="p-8" role="status">A verificar partilha…</main>;
+  }
+
+  // Convidados sem sessão: autenticar primeiro, regressando ao editor diretamente.
+  const target = `/dashboard/${encodeURIComponent(info.projectId)}` +
+    `?owner=${encodeURIComponent(info.ownerId)}` +
+    `&share=${encodeURIComponent(linkId)}` +
+    (info.isVideo ? "&editor=video" : "");
+  const next = encodeURIComponent(target);
 
   return (
-    <main className="p-6 space-y-4">
-      <h1 className="text-2xl font-semibold">
-        {/* 🔒 anónimo não vê o nome real */}
-        Shared project{isAuthed && project ? `: ${project.name}` : ""}
-      </h1>
-
-      <p className="text-sm">
-        Permission: <strong>{info.permission}</strong>
+    <main className="p-8 space-y-4">
+      <h1 className="text-2xl font-semibold">Inicia sessão para abrir a partilha</h1>
+      <p className="text-sm text-muted-foreground">
+        Este projeto foi partilhado contigo com permissão de {info.permission === "edit" ? "edição" : "leitura"}.
       </p>
-
-      {/* ✅ READ: sempre pedir login para ver conteúdo */}
-      {info.permission === "read" && (
-        <div className="space-y-2">
-          <p className="text-xs text-muted-foreground">
-            Login is required to access shared project contents.
-          </p>
-          {isAuthed ? (
-            <Link
-              href={editorUrl}
-              className="inline-flex items-center px-3 py-1.5 rounded bg-blue-600 text-white text-sm hover:bg-blue-700"
-            >
-              Open
-            </Link>
-          ) : (
-            <div className="flex flex-wrap gap-2">
-              <Link
-                href={`/login?next=${nextParam}`}
-                className="inline-flex items-center px-3 py-1.5 rounded bg-blue-600 text-white text-sm hover:bg-blue-700"
-              >
-                Login and open
-              </Link>
-              <Link
-                href={`/register?next=${nextParam}`}
-                className="inline-flex items-center px-3 py-1.5 rounded bg-muted text-sm hover:bg-muted/80 border border-border"
-              >
-                Register and open
-              </Link>
-            </div>
-          )}
-        </div>
-      )}
-
-      {/* ✅ EDIT: permite abrir editor (mas só funciona com login) */}
-      {info.permission === "edit" && (
-        <div className="space-y-2">
-          <p className="text-xs text-muted-foreground">
-            This link allows editing. Login is required to open in the editor.
-          </p>
-
-          {isAuthed ? (
-            <Link
-              href={editorUrl}
-              className="inline-flex items-center px-3 py-1.5 rounded bg-blue-600 text-white text-sm hover:bg-blue-700"
-            >
-              Open in editor
-            </Link>
-          ) : (
-            <div className="flex flex-wrap gap-2">
-              <Link
-                href={`/login?next=${nextParam}`}
-                className="inline-flex items-center px-3 py-1.5 rounded bg-blue-600 text-white text-sm hover:bg-blue-700"
-              >
-                Login and open
-              </Link>
-              <Link
-                href={`/register?next=${nextParam}`}
-                className="inline-flex items-center px-3 py-1.5 rounded bg-muted text-sm hover:bg-muted/80 border border-border"
-              >
-                Register and open
-              </Link>
-            </div>
-          )}
-        </div>
-      )}
-
-      {/* 🔒 só mostra imagens se estiver autenticado e já tiver project carregado */}
-      {!isAuthed || !project ? null : project.imgs.length === 0 ? (
-        <p className="text-sm text-muted-foreground">This project has no images.</p>
-      ) : (
-        <div className="grid gap-4 grid-cols-1 sm:grid-cols-2 md:grid-cols-3">
-          {project.imgs.map((img) => (
-            <div key={img._id} className="border rounded shadow-sm overflow-hidden">
-              <img src={img.url} alt={img.name} className="w-full h-auto object-cover" />
-              <div className="px-2 py-1 text-xs text-muted-foreground truncate">
-                {img.name}
-              </div>
-            </div>
-          ))}
-        </div>
-      )}
+      <div className="flex flex-wrap gap-3">
+        <Link href={`/login?next=${next}`} className="inline-flex items-center rounded bg-blue-600 px-4 py-2 text-white text-sm">
+          Iniciar sessão
+        </Link>
+        <Link href={`/register?next=${next}`} className="inline-flex items-center rounded border border-border px-4 py-2 text-sm">
+          Criar conta
+        </Link>
+      </div>
     </main>
   );
 }

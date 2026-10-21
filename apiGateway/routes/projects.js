@@ -148,7 +148,7 @@ router.post(
     try {
       const resposta = await axios.post(
         projectsURL +
-          `${req.params.user}/${req.params.project}/video/process`,
+          `${req.params.user}/${req.params.project}/video/process` + (req.query.share ? `?share=${encodeURIComponent(String(req.query.share))}` : ""),
         {
           filters: req.body?.filters,
         },
@@ -174,6 +174,47 @@ router.post(
 );
 
 
+// UC-03: obter o original pela API autenticada, sem expor a credencial S3.
+router.get("/:user/:project/video/original", auth.checkToken, async (req, res) => {
+  const { user, project } = req.params;
+  try {
+    const resposta = await axios.get(
+      `${projectsURL}${encodeURIComponent(user)}/${encodeURIComponent(project)}/video/original` + (req.query.share ? `?share=${encodeURIComponent(String(req.query.share))}` : ""),
+      { httpsAgent, responseType: "stream", timeout: 120000, maxRedirects: 0,
+        headers: { Authorization: req.headers.authorization } }
+    );
+    res.set({
+      "Content-Type": "video/mp4", "Cache-Control": "private, no-store",
+      "X-Content-Type-Options": "nosniff",
+    });
+    if (resposta.headers["content-length"]) res.set("Content-Length", resposta.headers["content-length"]);
+    resposta.data.on("error", (err) => { console.error("[GATEWAY VIDEO ORIGINAL] Stream:", err.message); res.destroy(err); });
+    res.on("close", () => { if (!res.writableEnded) resposta.data.destroy(); });
+    resposta.data.pipe(res);
+  } catch (err) {
+    console.error("[GATEWAY VIDEO ORIGINAL] Erro:", err.message);
+    if (res.headersSent) return res.destroy(err);
+    if (err.response?.data?.destroy) err.response.data.destroy();
+    const code = err.response?.status;
+    return res.status([400,401,403,404].includes(code) ? code : 502).json({
+      message: code === 404 ? "Video original nao encontrado." : "Nao foi possivel recuperar o video original.",
+    });
+  }
+});
+
+// UC-03: recuperar estado persistido do editor de video.
+router.get("/:user/:project/video/saved", auth.checkToken, async (req, res) => {
+  try {
+    const response = await axios.get(
+      `${projectsURL}${encodeURIComponent(req.params.user)}/${encodeURIComponent(req.params.project)}/video/saved` + (req.query.share ? `?share=${encodeURIComponent(String(req.query.share))}` : ""),
+      { httpsAgent, headers: { Authorization: req.headers.authorization }, timeout: 30000 }
+    );
+    return res.status(response.status).json(response.data);
+  } catch (err) {
+    return forwardAxiosError(res, err, "Nao foi possivel recuperar o video guardado.");
+  }
+});
+
 //AB Consultar o estado de um processamento de vídeo.
 router.get(
   "/:user/:project/video/process/:processId",
@@ -183,7 +224,7 @@ router.get(
       const resposta = await axios.get(
         projectsURL +
           `${req.params.user}/${req.params.project}/video/process/` +
-          encodeURIComponent(req.params.processId),
+          encodeURIComponent(req.params.processId) + (req.query.share ? `?share=${encodeURIComponent(String(req.query.share))}` : ""),
         {
           httpsAgent,
           headers: {
@@ -240,7 +281,7 @@ router.get("/:user/:project/video/process/:processId/result", auth.checkToken, a
   const { user, project, processId } = req.params;
   try {
     const resposta = await axios.get(
-      `${projectsURL}${encodeURIComponent(user)}/${encodeURIComponent(project)}/video/process/${encodeURIComponent(processId)}/result`,
+      `${projectsURL}${encodeURIComponent(user)}/${encodeURIComponent(project)}/video/process/${encodeURIComponent(processId)}/result` + (req.query.share ? `?share=${encodeURIComponent(String(req.query.share))}` : ""),
       { httpsAgent, responseType: "stream", timeout: 120000, maxRedirects: 0,
         headers: { Authorization: req.headers.authorization } }
     );

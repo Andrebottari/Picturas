@@ -639,6 +639,10 @@ const handleCancel = () => {
           <div className="flex items-center justify-between w-full xl:w-auto gap-2">
             <SidebarTrigger variant="outline" className="h-9 w-10 lg:hidden" />
                       <div className="flex items-center gap-2 flex-wrap justify-end xl:justify-normal w-full xl:w-auto">
+              {/* A partilha pertence ao projeto, em ambos os editores. */}
+              {!shareId && session.user._id === ownerId && (
+                <ShareProjectDialog projectId={project.data._id} projectVersion={project.data.version} />
+              )}
               {!videoEditor && mode !== "results" && (
                 <>
                   <Button
@@ -732,13 +736,6 @@ const handleCancel = () => {
                   <AddImagesDialog />
           </>
           )}
-                {/* botão Share só para o owner */}
-                {session.user._id === ownerId && (
-                  <ShareProjectDialog 
-                  projectId={project.data._id} 
-                  projectVersion={project.data.version}
-                />
-                )}
                 </>
               )}
 
@@ -841,9 +838,11 @@ const handleCancel = () => {
           </div>
         </div>
         {/* AB: UC-03 visível apenas ao proprietário; preserva o editor de imagens. */}
-        {videoEditor && !shareId && session.user._id === ownerId && (
+        {videoEditor && (!shareId || !shareRevoked) && (
           <VideoFiltersPanel
-            userId={session.user._id}
+            userId={ownerId}
+            shareId={shareId}
+            canModify={!shareRevoked && (session.user._id === ownerId || (!!shareId && canEdit))}
             projectId={pid}
             token={session.token}
             version={project.data.version}

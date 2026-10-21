@@ -2,9 +2,39 @@ const express = require("express");
 const fs = require("node:fs/promises");
 
 const path = require("node:path");
-const { randomUUID } = require("node:crypto");
+const { randomUUID, createHmac } = require("node:crypto");
+
+const axios = require("axios");
+const https = require("node:https");
+const fsSync = require("node:fs");
+const videoQuotaAgent = new https.Agent({
+  // Mantem a configuracao de comunicacao interna ja usada em projects.
+  // A validacao do certificado interno deve ser reforcada futuramente.
+  rejectUnauthorized: false,
+  key: fsSync.readFileSync(path.join(__dirname, "../certs/selfsigned.key")),
+  cert: fsSync.readFileSync(path.join(__dirname, "../certs/selfsigned.crt")),
+});
 
 const VideoProcess = require("../models/videoProcess");
+const { validateSharedVideo } = require("../utils/videoLimits");
+
+// HMAC interno: nunca expor este segredo/cabecalho ao browser.
+async function refundVideoQuota(processo) {
+  if (!processo?.actor_id || !processo?.msg_id || !process.env.JWT_SECRET_KEY) {
+    throw new Error("Dados necessarios para reembolso indisponiveis.");
+  }
+  const actorId = String(processo.actor_id);
+  const reservationId = String(processo.msg_id);
+  const signature = createHmac("sha256", process.env.JWT_SECRET_KEY)
+    .update(`uc03-refund-v1:${actorId}:${reservationId}`).digest("hex");
+  const response = await axios.post("https://users:10001/video/quota/refund", { actorId, reservationId }, {
+    httpsAgent: videoQuotaAgent,
+    headers: { "X-Video-Quota-Signature": signature },
+    timeout: 5000,
+  });
+  return response.data;
+}
+
 
 const {
   descarregarVideoOriginal,
@@ -16,7 +46,15 @@ const {
 
 const router = express.Router();
 
+// Conciliacao autonoma: so processamentos definitivamente falhados.
+// Nunca inferir falha de mensagens ainda pendentes ou em processamento.
+const { createQuotaRecovery, startQuotaRecovery } = require("../utils/videoQuotaRecovery");
+const quotaRecovery = createQuotaRecovery({ VideoProcess, refundVideoQuota, log: console });
+startQuotaRecovery(quotaRecovery, { intervalMs: 60000 });
+
+
 const { requireVideoOwner } = require("../middleware/videoAuth");
+const { requireVideoEditor } = require("../middleware/videoEditor");
 const {
   requireVideoProjectOwner,
 } = require("../middleware/videoProjectOwner");
@@ -26,6 +64,21 @@ const {
 const { videoUpload } = require("../middleware/videoUpload");
 
 const Project = require("../controllers/project");
+const { checkSharePermission } = require("../middleware/shareAuth");
+// As leituras podem ser partilhadas. A autorização nunca usa apenas ?share:
+// checkSharePermission consulta o MongoDB e confirma o vínculo ao projeto.
+async function requireReadableVideoProject(req, res, next) {
+  try {
+    const found = await Project.getOne(req.params.user, req.params.project);
+    if (!found) return res.status(404).json({ message: "Projeto não encontrado." });
+    req.videoProject = found;
+    return next();
+  } catch (err) {
+    console.error("[VIDEO SHARE] Projeto indisponível:", err.message);
+    return res.status(404).json({ message: "Projeto não encontrado." });
+  }
+}
+
 const { postVideo } = require("../utils/videoStorage");
 
 //AB Carregar o vídeo original de um projeto, sem alterar as imagens.
@@ -175,8 +228,7 @@ router.post(
 //AB Iniciar a aplicação assíncrona de filtros visuais a um vídeo.
 router.post(
   "/:user/:project/video/process",
-  requireVideoOwner,
-  requireVideoProjectOwner,
+  requireVideoEditor,
   requireVideoProjectVersion,
   async (req, res) => {
     const userId = req.params.user;
@@ -196,6 +248,31 @@ router.post(
       });
     }
 
+    // Limites padrão da edição partilhada, configuráveis no serviço projects.
+    // Não altera os limites históricos do proprietário.
+    if (req.videoGuestEditor) {
+      const validation = validateSharedVideo(projeto.video);
+      if (!validation.ok) {
+        return res.status(422).json({ message: validation.message });
+      }
+    }
+    // No máximo uma execução ativa por projeto e por convidado.
+    try {
+      const activeProject = await VideoProcess.exists({
+        user_id: userId, project_id: projectId, status: { $in: ["pending", "processing"] }
+      });
+      if (activeProject) return res.status(409).json({ message: "Já existe um processamento ativo neste projeto." });
+      if (req.videoGuestEditor) {
+        const activeActor = await VideoProcess.exists({
+          actor_id: req.videoAuthenticatedUserId,
+          status: { $in: ["pending", "processing"] }
+        });
+        if (activeActor) return res.status(429).json({ message: "Já tens um processamento ativo." });
+      }
+    } catch (error) {
+      return res.status(503).json({ message: "Não foi possível verificar os processamentos ativos." });
+    }
+
     const filters = req.body?.filters;
 
     const messageId = randomUUID();
@@ -213,12 +290,14 @@ router.post(
     let processo = null;
     let publicado = false;
     let publicacaoIniciada = false;
+    let quotaReservada = false;
 
     try {
       //AB Validar os filtros com as regras do modelo VideoProcess.
       processo = new VideoProcess({
         user_id: userId,
         project_id: projectId,
+        actor_id: req.videoAuthenticatedUserId,
         msg_id: messageId,
         status: "pending",
         filters,
@@ -254,6 +333,33 @@ router.post(
         },
       };
 
+
+      // UC-03: cobrar uma operacao ao ator real (proprietario ou convidado).
+      // A reserva e atomica no users-ms; nenhuma chamada a FFmpeg e publicada
+      // quando a quota estiver esgotada ou o servico estiver indisponivel.
+      try {
+        await axios.post("https://users:10001/video/quota/reserve", { reservationId: messageId }, {
+          httpsAgent: videoQuotaAgent,
+          headers: { Authorization: req.headers.authorization },
+          timeout: 5000,
+        });
+        quotaReservada = true;
+      } catch (quotaError) {
+        // Esta tarefa ainda nao foi publicada; invalidar antes de responder.
+        await VideoProcess.findOneAndUpdate(
+          { _id: processo._id, status: "pending" },
+          { $set: { status: "failed", finished_at: new Date(),
+              error_message: "Operacao nao publicada: quota indisponivel." } }
+        );
+        const status = quotaError.response?.status;
+        if ([401, 403, 404, 429].includes(status)) {
+          return res.status(status).json({
+            message: quotaError.response?.data?.message || "Quota de video indisponivel."
+          });
+        }
+        console.error("[VIDEO QUOTA] Falha no users-ms:", quotaError.message);
+        return res.status(503).json({ message: "Nao foi possivel verificar a quota de video." });
+      }
 
       //AB A partir daqui, uma falha pode ter confirmação RabbitMQ incerta.
       publicacaoIniciada = true;
@@ -308,6 +414,10 @@ if (processo && !publicacaoIniciada) {
     );
   }
 
+  if (quotaReservada) {
+    try { await refundVideoQuota(processo); }
+    catch (refundError) { console.error("[VIDEO QUOTA] Reembolso pendente:", refundError.message); }
+  }
   return res.status(503).json({
     message:
       "Não foi possível preparar o vídeo para processamento.",
@@ -351,11 +461,94 @@ return res.status(503).json({
   }
 );
 
+// UC-03: devolver o MP4 original associado ao projeto, nunca uma chave fornecida
+// pelo cliente. As verificacoes do proprietario acontecem antes do acesso S3.
+router.get(
+  "/:user/:project/video/original",
+  checkSharePermission,
+  requireReadableVideoProject,
+  async (req, res) => {
+    const { user, project } = req.params;
+    const key = req.videoProject?.video?.original_key;
+    const prefix = `${project}/src/`;
+    const fileName = typeof key === "string" && key.startsWith(prefix)
+      ? key.slice(prefix.length) : "";
+    // Confirmar UUID canonico para impedir nomes arbitrarios.
+    if (!/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}\.mp4$/i.test(fileName)) {
+      return res.status(404).json({ message: "Video original nao encontrado." });
+    }
+    const segredo = process.env.VIDEO_INTERNAL_SECRET;
+    if (!segredo) return res.status(503).json({ message: "Armazenamento indisponivel." });
+    const axios = require("axios");
+    try {
+      const resposta = await axios.get(
+        `${process.env.VIDEO_STORAGE_URL || "http://img_storage:11000"}/video-source/${user}/${project}/${fileName}`,
+        { responseType: "stream", timeout: 120000, maxRedirects: 0,
+          headers: { "X-Video-Internal-Secret": segredo } }
+      );
+      res.set({
+        "Content-Type": "video/mp4", "Cache-Control": "private, no-store",
+        "X-Content-Type-Options": "nosniff",
+      });
+      if (resposta.headers["content-length"]) res.set("Content-Length", resposta.headers["content-length"]);
+      resposta.data.on("error", (err) => { console.error("[VIDEO ORIGINAL] Stream:", err.message); res.destroy(err); });
+      res.on("close", () => { if (!res.writableEnded) resposta.data.destroy(); });
+      resposta.data.pipe(res);
+    } catch (err) {
+      console.error("[VIDEO ORIGINAL] Erro:", err.message);
+      if (res.headersSent) return res.destroy(err);
+      if (err.response?.data?.destroy) err.response.data.destroy();
+      return res.status(err.response?.status === 404 ? 404 : 502).json({
+        message: err.response?.status === 404 ? "Video original nao encontrado." : "Nao foi possivel recuperar o video original.",
+      });
+    }
+  }
+);
+
+// UC-03: recuperar o ultimo processamento persistido no MongoDB e os metadados
+// do video original. Nunca confiar em identificadores guardados no browser.
+router.get(
+  "/:user/:project/video/saved",
+  checkSharePermission,
+  requireReadableVideoProject,
+  async (req, res) => {
+    try {
+      const { user, project } = req.params;
+      const original = req.videoProject?.video ?? null;
+      const latest = original?.original_key
+        ? await VideoProcess.findOne({
+            user_id: user,
+            project_id: project,
+            input_video_key: original.original_key,
+          }).sort({ createdAt: -1, _id: -1 }).lean()
+        : null;
+      return res.status(200).json({
+        original: original ? {
+          name: original.original_name,
+          sizeBytes: original.size_bytes,
+          durationSeconds: original.duration_seconds,
+        } : null,
+        process: latest ? {
+          processId: String(latest._id),
+          status: latest.status,
+          progress: latest.progress,
+          filters: latest.filters,
+          outputVideoKey: latest.output_video_key,
+          errorMessage: latest.error_message,
+        } : null,
+      });
+    } catch (err) {
+      console.error("[VIDEO SAVED]", err.message);
+      return res.status(503).json({ message: "Nao foi possivel recuperar o video guardado." });
+    }
+  }
+);
+
 //AB Consultar o estado de um processamento de vídeo do projeto.
 router.get(
   "/:user/:project/video/process/:processId",
-  requireVideoOwner,
-  requireVideoProjectOwner,
+  checkSharePermission,
+  requireReadableVideoProject,
   async (req, res) => {
     const { user, project, processId } = req.params;
 
@@ -378,6 +571,13 @@ router.get(
         return res.status(404).json({
           message: "Processamento de vídeo não encontrado.",
         });
+      }
+
+      // Se o worker marcou uma falha definitiva, o polling permite
+      // reconciliar o reembolso. O users-ms garante idempotencia.
+      if (processo.status === "failed" && processo.actor_id && processo.msg_id) {
+        try { await refundVideoQuota(processo); }
+        catch (refundError) { console.error("[VIDEO QUOTA] Reembolso pendente:", refundError.message); }
       }
 
       return res.status(200).json({
@@ -408,8 +608,8 @@ router.get(
 //AB O nome S3 nunca é fornecido pelo cliente: vem do registo validado no MongoDB.
 router.get(
   "/:user/:project/video/process/:processId/result",
-  requireVideoOwner,
-  requireVideoProjectOwner,
+  checkSharePermission,
+  requireReadableVideoProject,
   async (req, res) => {
     const { user, project, processId } = req.params;
     if (!/^[a-f0-9]{24}$/i.test(processId)) {
@@ -428,11 +628,13 @@ router.get(
       if (!match) {
         return res.status(409).json({ message: "Resultado de vídeo inválido ou indisponível." });
       }
+      // O nome do ficheiro é extraído da chave persistida e validada, nunca do pedido.
+      const fileName = match[1];
       const segredo = process.env.VIDEO_INTERNAL_SECRET;
       if (!segredo) return res.status(503).json({ message: "Armazenamento indisponível." });
       const axios = require("axios");
       const resposta = await axios.get(
-        `${process.env.VIDEO_STORAGE_URL || "http://img_storage:11000"}/video-output/${user}/${project}/${match[1]}`,
+        `${process.env.VIDEO_STORAGE_URL || "http://img_storage:11000"}/video-output/${user}/${project}/${fileName}`,
         { responseType: "stream", timeout: 120000, maxRedirects: 0,
           headers: { "X-Video-Internal-Secret": segredo } }
       );

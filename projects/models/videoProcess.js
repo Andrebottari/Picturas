@@ -31,6 +31,9 @@ const videoProcessSchema = new mongoose.Schema(
       index: true,
     },
 
+    // Quem solicitou o processamento (pode ser colaborador edit).
+    actor_id: { type: mongoose.Schema.Types.ObjectId, index: true },
+
     msg_id: {
       type: String,
       required: true,

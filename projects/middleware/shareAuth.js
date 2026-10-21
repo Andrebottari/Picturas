@@ -1,44 +1,45 @@
-// projects/middleware/shareAuth.js
+// Protege acessos normais e partilhados aos recursos do projeto.
 const Project = require("../controllers/project");
+const { getCallerId } = require("../utils/caller");
 
 async function checkSharePermission(req, res, next) {
-  const shareId = req.query.share;
+  try {
+    const auth = req.headers.authorization;
+    const caller = getCallerId(req);
+    if (!auth || !auth.startsWith("Bearer ") || !caller) {
+      return res.status(401).jsonp("Authentication required");
+    }
 
-  if (!shareId) return next(); // acesso normal (dono / rotas sem share)
+    const owner = req.params.user;
+    const shareId = req.query.share;
+    if (!shareId) {
+      if (String(caller) !== String(owner)) {
+        return res.status(403).jsonp("Not allowed");
+      }
+      return next();
+    }
 
-  //  share link exige autenticação
-  const auth = req.headers.authorization;
-  if (!auth || !auth.startsWith("Bearer ")) {
-    return res.status(401).jsonp("Authentication required for share links");
+    const project = await Project.getOneByShareId(shareId);
+    if (!project) return res.status(404).jsonp("Share link not found");
+    const link = (project.sharedLinks || []).find((l) => l.id === shareId);
+    if (!link || link.revoked) return res.status(410).jsonp("Share link unavailable");
+    if (owner && String(owner) !== String(project.user_id)) {
+      return res.status(403).jsonp("Share link does not match this project owner");
+    }
+    if (req.params.project && String(req.params.project) !== String(project._id)) {
+      return res.status(403).jsonp("Share link does not match this project");
+    }
+    req.sharedProject = project;
+    req.sharedPermission = link.permission;
+    return next();
+  } catch (e) {
+    console.error("Share permission check failed:", e.message);
+    return res.status(500).jsonp("Error checking project permissions");
   }
-
-  const project = await Project.getOneByShareId(shareId);
-  if (!project) return res.status(404).jsonp("Share link not found");
-
-  const link = (project.sharedLinks || []).find((l) => l.id === shareId);
-  if (!link) return res.status(410).jsonp("Share link not found");
-
-  if (link.revoked) return res.status(410).jsonp("Share link revoked");
-
-  if (req.params.user && String(req.params.user) !== String(project.user_id)) {
-    return res.status(403).jsonp("Share link does not match this project owner");
-  }
-  if (req.params.project && String(req.params.project) !== String(project._id)) {
-    return res.status(403).jsonp("Share link does not match this project");
-  }
-
-  req.sharedProject = project;
-  req.sharedPermission = link.permission;
-  next();
 }
 
 function requireEditPermission(req, res, next) {
-  // Caso A — dono (sem share)
-  if (!req.sharedPermission) return next();
-
-  // Caso B — share "edit"
-  if (req.sharedPermission === "edit") return next();
-
+  if (!req.sharedPermission || req.sharedPermission === "edit") return next();
   return res.status(403).jsonp("Share link has no edit permission");
 }
 

@@ -614,6 +614,7 @@ router.get("/share/:shareId", async (req, res) => {
       ownerId: project.user_id,
       permission: link.permission,
       projectName: project.name,
+      isVideo: Boolean(project.video?.original_key),
 
     });
   } catch (err) {
@@ -773,75 +774,56 @@ router.get("/:user", (req, res, next) => {
 });
 
 // Get a specific user's project
-router.get("/:user/:project", checkSharePermission, async (req, res, next) => {
+router.get("/:user/:project", checkSharePermission, async (req, res) => {
   try {
-    // só conta como “colaborador” se puder editar (dono ou share edit)
+    const project = await Project.getOne(req.params.user, req.params.project);
+    if (!project) return res.status(404).jsonp("Project not found");
+
+    // Nunca reservar presença antes de confirmar a existência e a autorização.
     const canEdit = !req.sharedPermission || req.sharedPermission === "edit";
-
     if (canEdit) {
-      const ownerId = req.params.user;
-      const projectId = req.params.project;
-      console.log("[GET /:user/:project headers]", {
-        hasAuth: !!req.headers.authorization,
-        authStart: req.headers.authorization?.slice(0, 20),
-        caller: getCallerId(req),
-      });
-
       const callerId = getCallerId(req);
-      if (!callerId) {
-        return res.status(401).jsonp("Authentication required");
-      }
-
-      const result = await ensureEditorSlot({ ownerId, projectId, callerId });
-      if (!result.ok) {
+      if (!callerId) return res.status(401).jsonp("Authentication required");
+      const slot = await ensureEditorSlot({
+        ownerId: req.params.user,
+        projectId: req.params.project,
+        callerId,
+      });
+      if (!slot.ok) {
         return res.status(429).jsonp({
           message: "Too many active editors for this project",
-          active: result.active,
-          limit: result.limit,
+          active: slot.active,
+          limit: slot.limit,
         });
       }
     }
 
-    return next();
-  } catch (e) {
-    console.error("Presence limit error on GET /:user/:project:", e);
-    return res.status(500).jsonp("Error checking presence limit");
-  }
-}, (req, res, next) => {
-  Project.getOne(req.params.user, req.params.project)
-    .then(async (project) => {
-      const response = {
-        _id: project._id,
-        name: project.name,
-        tools: project.tools,
-        imgs: [],
-        version: project.version,
-      };
-
-      for (let img of project.imgs) {
-        try {
-          const resp = await get_image_public_url(
-            req.params.user,
-            req.params.project,
-            "src",
-            img.og_img_key
-          );
-          const url = resp.data.url;
-
-          response["imgs"].push({
-            _id: img._id,
-            name: path.basename(img.og_uri),
-            url: url,
-          });
-        } catch (_) {
-          res.status(404).jsonp(`Error acquiring image's url`);
-          return;
-        }
+    const response = {
+      _id: project._id,
+      name: project.name,
+      tools: project.tools,
+      imgs: [],
+      version: project.version,
+    };
+    for (const img of project.imgs) {
+      try {
+        const resp = await get_image_public_url(
+          req.params.user, req.params.project, "src", img.og_img_key
+        );
+        response.imgs.push({
+          _id: img._id,
+          name: path.basename(img.og_uri),
+          url: resp.data.url,
+        });
+      } catch (e) {
+        return res.status(502).jsonp("Error acquiring image's url");
       }
-
-      res.status(200).jsonp(response);
-    })
-    .catch((_) => res.status(501).jsonp(`Error acquiring user's project`));
+    }
+    return res.status(200).jsonp(response);
+  } catch (e) {
+    console.error("Error acquiring project:", e.message);
+    return res.status(500).jsonp("Error acquiring user's project");
+  }
 });
 
 // Get a specific project's image
@@ -958,7 +940,7 @@ router.get("/:user/:project/process", checkSharePermission, (req, res, next) => 
       res.status(200).send(Buffer.from(b));
     })
     .catch((_) =>
-      res.status(601).jsonp(`Error acquiring project's processing result`)
+      res.status(500).jsonp(`Error acquiring project's processing result`)
     );
 });
 
@@ -967,6 +949,7 @@ router.get("/:user/:project/process", checkSharePermission, (req, res, next) => 
 router.get("/:user/:project/process/url", checkSharePermission, async (req, res) => {
   try {
     const project = await Project.getOne(req.params.user, req.params.project);
+    if (!project) return res.status(404).jsonp("Project not found");
     const committed = project.committedToken || 0;
 
     const results = await Result.getAllByToken(req.params.user, req.params.project, committed);
@@ -982,7 +965,7 @@ router.get("/:user/:project/process/url", checkSharePermission, async (req, res)
 
     return res.status(200).jsonp(ans);
   } catch (e) {
-    return res.status(601).jsonp("Error acquiring project's processing result");
+    return res.status(500).jsonp("Error acquiring project's processing result");
   }
 });
 
@@ -2466,7 +2449,7 @@ router.post(
         ownerType: result.ownerType,
       });
     } catch (e) {
-      return res.status(501).jsonp("Error registering presence");
+      return res.status(500).jsonp("Error registering presence");
     }
   }
 );
@@ -2486,39 +2469,10 @@ router.delete(
       await releaseEditorSlot({ ownerId, projectId, callerId });
       return res.sendStatus(204);
     } catch (e) {
-      return res.status(501).jsonp("Error releasing presence");
+      return res.status(500).jsonp("Error releasing presence");
     }
   }
 );
-
-// heartbeat (cria/refresh presença)
-router.post("/:owner/:project/presence", async (req, res) => {
-  const ownerId = req.params.owner;
-  const projectId = req.params.project;
-  const callerId = req.headers["x-caller-id"] || ownerId;
-
-  const result = await ensureEditorSlot({ ownerId, projectId, callerId });
-
-  if (!result.ok) {
-    return res.status(429).jsonp({
-      message: "Too many active editors for this project",
-      active: result.active,
-      limit: result.limit,
-    });
-  }
-
-  return res.sendStatus(204);
-});
-
-// libertar presença
-router.delete("/:owner/:project/presence", async (req, res) => {
-  const ownerId = req.params.owner;
-  const projectId = req.params.project;
-  const callerId = req.headers["x-caller-id"] || ownerId;
-
-  await releaseEditorSlot({ ownerId, projectId, callerId });
-  return res.sendStatus(204);
-});
 
 // marcar projeto como dirty/clean (server-side)
 router.post(

@@ -26,6 +26,8 @@ const usersURL = "https://users:10001/";
 const projects_ms = "https://projects:10002/projects/";
 
 const max_free_daily_op = process.env.FREE_DAILY_OP || 5;
+const crypto = require("node:crypto");
+const { isUUID } = { isUUID: (s) => typeof s === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(s) };
 
 function get_cur_date() {
   const date = new Date();
@@ -73,6 +75,112 @@ function check_process(user, op, op_num) {
     (user.type == "anonymous" && op_num == 0)
   );
 }
+
+// UC-03: reserva atomica de UMA operacao para video, cobrada ao utilizador
+// autenticado. Reutiliza operations/processed e FREE_DAILY_OP do users-ms.
+// Esta rota NAO recebe o ID do utilizador nem custo do cliente.
+router.post("/video/quota/reserve", async (req, res) => {
+  const header = req.headers.authorization;
+  if (typeof header !== "string" || !header.startsWith("Bearer ")) {
+    return res.status(401).json({ message: "Autenticacao necessaria." });
+  }
+  let actor;
+  try {
+    if (!process.env.JWT_SECRET_KEY) throw new Error("JWT indisponivel");
+    const payload = require("jsonwebtoken").verify(header.slice(7), process.env.JWT_SECRET_KEY);
+    actor = payload && payload.id;
+    if (!require("mongoose").isValidObjectId(actor)) throw new Error("ID invalido");
+  } catch (_) {
+    return res.status(401).json({ message: "Token invalido ou expirado." });
+  }
+
+  const reservationId = req.body?.reservationId;
+  if (!isUUID(reservationId)) return res.status(400).json({ message: "reservationId invalido." });
+
+  try {
+    const UserModel = require("../models/user");
+    const { year, month, day } = get_cur_date();
+    // Igual a getRemainingOperations: preserva o dia utilizado no historico.
+    const today = new Date(year, month, day);
+    const limit = Number(max_free_daily_op);
+    if (!Number.isSafeInteger(limit) || limit < 1) {
+      return res.status(503).json({ message: "Quota diaria mal configurada." });
+    }
+
+    // Idempotencia por processamento. O debito e o registo da reserva sao
+    // efetuados NA MESMA operacao atomica sobre o documento do utilizador.
+    const previous = await UserModel.findOne({ _id: actor, "videoQuotaReservations.id": reservationId })
+      .select("videoQuotaReservations type").lean();
+    if (previous) {
+      const r = previous.videoQuotaReservations.find(x => x.id === reservationId);
+      return res.status(200).json({ allowed: true, alreadyReserved: true, refunded: r.status === "refunded" });
+    }
+    const newReservation = { id: reservationId, day: today, status: "reserved" };
+    // A consulta e o incremento ocorrem numa so operacao MongoDB.
+    // A insercao do registo do dia tambem e condicional e atomica.
+    let updated = await UserModel.findOneAndUpdate(
+      { _id: actor, type: "free", "videoQuotaReservations.id": { $ne: reservationId }, operations: { $elemMatch: { day: today, processed: { $lt: limit } } } },
+      { $inc: { "operations.$.processed": 1 }, $push: { videoQuotaReservations: newReservation } },
+      { new: true }
+    );
+    if (!updated) {
+      updated = await UserModel.findOneAndUpdate(
+        { _id: actor, type: "free", "videoQuotaReservations.id": { $ne: reservationId }, operations: { $not: { $elemMatch: { day: today } } } },
+        { $push: { operations: { day: today, processed: 1 }, videoQuotaReservations: newReservation } },
+        { new: true }
+      );
+    }
+    if (updated) {
+      const current = updated.operations.find(x => x.day.getTime() === today.getTime());
+      return res.status(200).json({ allowed: true, remaining: Math.max(0, limit - current.processed) });
+    }
+    const user = await UserModel.findById(actor).select("type").lean();
+    if (!user) return res.status(404).json({ message: "Utilizador nao encontrado." });
+    if (user.type === "premium") return res.status(200).json({ allowed: true, remaining: null });
+    if (user.type === "anonymous") return res.status(403).json({ message: "Conta anonima sem quota de video." });
+    return res.status(429).json({ message: "Limite diario de operacoes atingido." });
+  } catch (error) {
+    console.error("[VIDEO QUOTA] Falha na reserva:", error.message);
+    return res.status(503).json({ message: "Nao foi possivel reservar a quota." });
+  }
+});
+
+// Apenas services que conhecem JWT_SECRET_KEY podem solicitar reembolso.
+// A autenticacao do utilizador NAO autoriza este endpoint: a assinatura HMAC
+// e independente do JWT e vincula utilizador + processamento.
+router.post("/video/quota/refund", async (req, res) => {
+  const { actorId, reservationId } = req.body || {};
+  if (!require("mongoose").isValidObjectId(actorId) || !isUUID(reservationId)) {
+    return res.status(400).json({ message: "Reserva invalida." });
+  }
+  const secret = process.env.JWT_SECRET_KEY;
+  const provided = req.headers["x-video-quota-signature"];
+  if (!secret || typeof provided !== "string" || !/^[a-f0-9]{64}$/.test(provided)) {
+    return res.status(403).json({ message: "Servico nao autorizado." });
+  }
+  const expected = crypto.createHmac("sha256", secret)
+    .update(`uc03-refund-v1:${actorId}:${reservationId}`).digest("hex");
+  if (!crypto.timingSafeEqual(Buffer.from(provided, "hex"), Buffer.from(expected, "hex"))) {
+    return res.status(403).json({ message: "Servico nao autorizado." });
+  }
+  try {
+    const Model = require("../models/user");
+    const stored = await Model.findOne({ _id: actorId, type: "free", "videoQuotaReservations.id": reservationId })
+      .select("videoQuotaReservations").lean();
+    const reservation = stored?.videoQuotaReservations?.find(x => x.id === reservationId);
+    if (!reservation) return res.status(200).json({ refunded: false, reason: "not-found" });
+    if (reservation.status === "refunded") return res.status(200).json({ refunded: false, reason: "already-refunded" });
+    const result = await Model.updateOne(
+      { _id: actorId, type: "free", videoQuotaReservations: { $elemMatch: { id: reservationId, status: "reserved" } } },
+      { $inc: { "operations.$[op].processed": -1 }, $set: { "videoQuotaReservations.$[reservation].status": "refunded" } },
+      { arrayFilters: [ { "op.day": reservation.day, "op.processed": { $gt: 0 } }, { "reservation.id": reservationId, "reservation.status": "reserved" } ] }
+    );
+    return res.status(200).json({ refunded: result.modifiedCount === 1 });
+  } catch (error) {
+    console.error("[VIDEO QUOTA] Falha no reembolso:", error.message);
+    return res.status(503).json({ message: "Nao foi possivel devolver a operacao." });
+  }
+});
 
 // Get list of all users
 router.get("/", function (req, res, next) {
@@ -191,9 +299,6 @@ router.post("/", function (req, res, next) {
   }
 
   console.log("---- USERS-MS: REGISTER REQUEST ----");
-  console.log("BODY:", req.body);
-  console.log("USER OBJECT BEFORE SAVE:", user);
-  console.log("User object to persist:", user);
 
   User.create(user)
     .then((createdUser) => {
